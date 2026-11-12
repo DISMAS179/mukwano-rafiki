@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mukwano-Rafiki — Luganda, Swahili &amp; English Translator Helper</title>
+    <meta
+      name="description"
+      content="Your friend between languages. A mobile-first Luganda, Swahili, and English translation helper for students, market vendors, and clinic visitors in East Africa."
+    />
+    <meta property="og:title" content="Mukwano-Rafiki — Luganda, Swahili &amp; English Translator Helper" />
+    <meta
+      property="og:description"
+      content="Your friend between languages. Natural Luganda–Swahili–English translations for everyday market, clinic, and school conversations."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('mr_theme');
+          var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          if (saved === 'dark' || (!saved && prefersDark)) {
+            document.documentElement.classList.add('dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body class="bg-[#F8F7F2] text-[#1C1B18] dark:bg-[#0D1310] dark:text-[#F3F2EC] antialiased selection:bg-emerald-200 selection:text-emerald-950 dark:selection:bg-emerald-800 dark:selection:text-emerald-50">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

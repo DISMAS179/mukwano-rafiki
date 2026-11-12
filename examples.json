@@ -1,0 +1,74 @@
+[
+  {
+    "id": "ex-lg-1",
+    "status": "unverified",
+    "verified": false,
+    "domain": "Greetings",
+    "input": "Oly'otya ssebo? Amaka go gali gatya?",
+    "detected_language": "Luganda",
+    "target_language": "English",
+    "translation": "How are you, sir? How is your family at home?",
+    "confidence": "high",
+    "notes": "Polite greeting using 'ssebo' (sir/mister) and asking after the household ('amaka')."
+  },
+  {
+    "id": "ex-lg-2",
+    "status": "unverified",
+    "verified": false,
+    "domain": "Market",
+    "input": "Kino kigula ssente mmeka? Nsasule UGX 5,000?",
+    "detected_language": "Luganda",
+    "target_language": "English",
+    "translation": "How much does this cost? Can I pay UGX 5,000?",
+    "confidence": "high",
+    "notes": "Common market bargaining phrase; 'UGX 5,000' is kept unchanged."
+  },
+  {
+    "id": "ex-sw-1",
+    "status": "unverified",
+    "verified": false,
+    "domain": "Greetings",
+    "input": "Shikamoo mzee, habari za asubuhi?",
+    "detected_language": "Swahili",
+    "target_language": "English",
+    "translation": "I respectfully greet you, elder. How is your morning?",
+    "confidence": "high",
+    "notes": "'Shikamoo' is a traditional Swahili greeting showing deep respect to an elder; standard reply is 'Marahaba'."
+  },
+  {
+    "id": "ex-sw-2",
+    "status": "unverified",
+    "verified": false,
+    "domain": "Health",
+    "input": "Nina homa kali na kichwa kinaniuma tangu jana.",
+    "detected_language": "Swahili",
+    "target_language": "English",
+    "translation": "I have a high fever and a headache since yesterday.",
+    "confidence": "high",
+    "notes": "Clear clinic symptom description in standard Swahili."
+  },
+  {
+    "id": "ex-en-1",
+    "status": "unverified",
+    "verified": false,
+    "domain": "Health",
+    "input": "Take two tablets after eating, morning and evening.",
+    "detected_language": "English",
+    "target_language": "Luganda",
+    "translation": "Mira obukerenda bubiri nga omaze okulya, ku makya n'akawungeezi.",
+    "confidence": "high",
+    "notes": "Natural clinic dosage instruction in Luganda; 'obukerenda' means tablets/pills."
+  },
+  {
+    "id": "ex-en-2",
+    "status": "unverified",
+    "verified": false,
+    "domain": "School",
+    "input": "When does the mathematics exam start tomorrow?",
+    "detected_language": "English",
+    "target_language": "Luganda",
+    "translation": "Ekigezo ky'okubala kitandika ddi enkya?",
+    "confidence": "high",
+    "notes": "Under Auto target rule, English defaults to Luganda. 'Ekigezo' means exam/test; 'okubala' means mathematics."
+  }
+]
