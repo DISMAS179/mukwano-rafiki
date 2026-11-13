@@ -139,7 +139,7 @@ To contribute, fork the repository, create a branch, make your changes, run the 
 
 ## License
 
-[MIT]
+This project is licensed under the [MIT License](./LICENSE).
 
 ## Acknowledgements
 
