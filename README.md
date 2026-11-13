@@ -130,11 +130,12 @@ To contribute, fork the repository, create a branch, make your changes, run the 
 ## Team
 
 | Name | Role / contribution |
-| [Eleni]      |[Documentation]    |
-| [Dismas]     | [Project Leader]  |
-| [Kieth]      | [Demo & Design]   |
-| [Changkuoth] | [Swahili Tester ] |
-| [Turuk]      | [Luganda Tester]  |
+|---|---|
+| Eleni | Documentation |
+| Dismas | Project Leader |
+| Kieth | Demo & Design |
+| Changkuoth | Swahili Tester |
+| Turuk | Luganda Tester |
 
 ## License
 
