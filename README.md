@@ -8,9 +8,9 @@ Mukwano-Rafiki is a multilingual helper for East Africa. It translates between *
 
 ## Live Demo
 
-**Try the app:** [https://mukwano-rafiki.ai.studio/]
+**Try the app:** [Add published app link]
 
-**Demo video:** [https://youtu.be/Ms0jaj8_1kk]
+**Demo video:** [Add demo video link]
 
 > **Note:** The app may take a few seconds to wake up on the first visit.
 
@@ -131,8 +131,6 @@ To contribute, fork the repository, create a branch, make your changes, run the 
 
 | Name | Role / contribution |
 |---|---|
-| Dismas | [Your contribution] |
-| [Keith Tugume] | [Documentation] |
 | [Name] | [Contribution] |
 
 ## License
