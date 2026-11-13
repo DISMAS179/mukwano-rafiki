@@ -34,8 +34,8 @@ We do not just trust the AI. Native speakers rate the output in Test mode.
 |---|---:|---:|---:|
 | English to Luganda | [10] | [8] | [80]% |
 | Luganda to English | [15] | [10] | [66]% |
-| English to Swahili | [X] | [X] | [X]% |
-| Swahili to English | [X] | [X] | [X]% |
+| English to Swahili | [10] | [10] | [100]% |
+| Swahili to English | [10] | [10] | [100]% |
 
 ## Built With
 
