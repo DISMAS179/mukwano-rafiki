@@ -1,46 +1,72 @@
 import { useEffect, useState } from 'react';
-import { AlertTriangle, BarChart3, ClipboardCheck, Languages, Moon, Sun } from 'lucide-react';
+import {
+  AlertTriangle,
+  BarChart3,
+  ClipboardCheck,
+  Languages,
+  MessageCircle,
+  Moon,
+  Sun,
+} from 'lucide-react';
+import { ChatView } from './components/ChatView';
 import { ResultsView } from './components/ResultsView';
 import { TestModeView } from './components/TestModeView';
 import { TranslatorView } from './components/TranslatorView';
 import type {
   AppView,
+  BadReplyReport,
   BadTranslationReport,
+  ChatMessage,
+  ChatTestEvaluation,
   HistoryItem,
   ModelChoice,
   TestPhraseEvaluation,
   ThemeMode,
-  VoiceTestEvaluation,
+  UserProfile,
 } from './types';
 import { DEFAULT_MODEL_CONFIG, fetchHealthConfig, type ServerHealthConfig } from './utils/api';
 import {
+  DEFAULT_USER_PROFILE,
+  clearPersonalChatData,
+  loadBadReplyReports,
+  loadChatHistory,
+  loadChatTestEvaluations,
   loadHistory,
   loadReports,
   loadTestEvaluations,
   loadTheme,
-  loadVoiceTestEvaluations,
+  loadUserProfile,
+  mergeChatTestEvaluation,
   mergeTestEvaluation,
-  mergeVoiceTestEvaluation,
+  persistBadReplyReports,
+  persistChatHistory,
+  persistChatTestEvaluations,
   persistHistory,
   persistReports,
   persistTestEvaluations,
-  persistVoiceTestEvaluations,
+  persistUserProfile,
+  removeChatTestEvaluationsForModel,
   removeTestEvaluationsForModel,
-  removeVoiceTestEvaluationsForModel,
   saveTheme,
 } from './utils/storage';
 
 export default function App() {
-  const [view, setView] = useState<AppView>('translate');
+  const [view, setView] = useState<AppView>('chat');
   const [theme, setTheme] = useState<ThemeMode>(() => loadTheme());
+  const [profile, setProfile] = useState<UserProfile>(() => loadUserProfile());
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => loadChatHistory());
+  const [badReplyReports, setBadReplyReports] = useState<BadReplyReport[]>(() =>
+    loadBadReplyReports(),
+  );
+  const [chatEvaluations, setChatEvaluations] = useState<Record<string, ChatTestEvaluation>>(() =>
+    loadChatTestEvaluations(),
+  );
   const [history, setHistory] = useState<HistoryItem[]>(() => loadHistory());
   const [reports, setReports] = useState<BadTranslationReport[]>(() => loadReports());
   const [evaluations, setEvaluations] = useState<Record<string, TestPhraseEvaluation>>(() =>
     loadTestEvaluations(),
   );
-  const [voiceEvaluations, setVoiceEvaluations] = useState<
-    Record<string, VoiceTestEvaluation>
-  >(() => loadVoiceTestEvaluations());
+  const [pendingTranslateText, setPendingTranslateText] = useState<string | null>(null);
   const [modelConfig, setModelConfig] = useState<ServerHealthConfig>(DEFAULT_MODEL_CONFIG);
   const [storageWarning, setStorageWarning] = useState(false);
 
@@ -66,6 +92,51 @@ export default function App() {
 
   function toggleTheme() {
     setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
+  }
+
+  function handleSaveProfile(nextProfile: UserProfile) {
+    setProfile(nextProfile);
+    if (!persistUserProfile(nextProfile)) setStorageWarning(true);
+  }
+
+  function handleAddChatMessages(newMessages: ChatMessage[]) {
+    setChatMessages((prev) => {
+      const next = [...prev, ...newMessages].slice(-60);
+      if (!persistChatHistory(next)) setStorageWarning(true);
+      return next;
+    });
+  }
+
+  function handleNewConversation() {
+    persistChatHistory([]);
+    setChatMessages([]);
+  }
+
+  function handleClearPersonalData() {
+    clearPersonalChatData();
+    setProfile(DEFAULT_USER_PROFILE);
+    setChatMessages([]);
+  }
+
+  function handleSubmitBadReplyReport(report: BadReplyReport) {
+    setBadReplyReports((prev) => {
+      const next = [report, ...prev];
+      if (!persistBadReplyReports(next)) setStorageWarning(true);
+      return next;
+    });
+  }
+
+  function handleDeleteBadReplyReport(id: string) {
+    setBadReplyReports((prev) => {
+      const next = prev.filter((r) => r.id !== id);
+      if (!persistBadReplyReports(next)) setStorageWarning(true);
+      return next;
+    });
+  }
+
+  function handleTranslateReply(text: string) {
+    setPendingTranslateText(text);
+    setView('translate');
   }
 
   function handleTranslationSuccess(item: HistoryItem) {
@@ -97,6 +168,26 @@ export default function App() {
     });
   }
 
+  function handleUpdateChatEvaluation(
+    modelChoice: ModelChoice,
+    caseId: string,
+    patch: Partial<ChatTestEvaluation>,
+  ) {
+    setChatEvaluations((prev) => {
+      const next = mergeChatTestEvaluation(prev, modelChoice, caseId, patch);
+      if (!persistChatTestEvaluations(next)) setStorageWarning(true);
+      return next;
+    });
+  }
+
+  function handleResetChatEvaluations(modelChoice: ModelChoice) {
+    setChatEvaluations((prev) => {
+      const next = removeChatTestEvaluationsForModel(prev, modelChoice);
+      if (!persistChatTestEvaluations(next)) setStorageWarning(true);
+      return next;
+    });
+  }
+
   function handleUpdateEvaluation(
     modelChoice: ModelChoice,
     phraseId: string,
@@ -109,18 +200,6 @@ export default function App() {
     });
   }
 
-  function handleUpdateVoiceEvaluation(
-    modelChoice: ModelChoice,
-    phraseId: string,
-    patch: Partial<VoiceTestEvaluation>,
-  ) {
-    setVoiceEvaluations((prev) => {
-      const next = mergeVoiceTestEvaluation(prev, modelChoice, phraseId, patch);
-      if (!persistVoiceTestEvaluations(next)) setStorageWarning(true);
-      return next;
-    });
-  }
-
   function handleResetEvaluations(modelChoice: ModelChoice) {
     setEvaluations((prev) => {
       const next = removeTestEvaluationsForModel(prev, modelChoice);
@@ -129,26 +208,15 @@ export default function App() {
     });
   }
 
-  function handleResetVoiceEvaluations(modelChoice: ModelChoice) {
-    setVoiceEvaluations((prev) => {
-      const next = removeVoiceTestEvaluationsForModel(prev, modelChoice);
-      if (!persistVoiceTestEvaluations(next)) setStorageWarning(true);
-      return next;
-    });
-  }
-
   return (
     <div className="min-h-screen flex flex-col bg-[#F8F7F2] text-[#1C1B18] dark:bg-[#0D1310] dark:text-[#F3F2EC] pb-20 md:pb-0">
-      {/* Header (non-sticky on mobile to preserve viewport space under 15% sticky cap) */}
+      {/* Header (3-zone top bar) */}
       <header className="border-b border-stone-200/90 bg-white/95 dark:border-emerald-950/90 dark:bg-[#111915]/95">
         <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3.5 sm:px-6">
           <div className="min-w-0">
-            <h1 className="text-lg font-bold tracking-tight text-emerald-950 dark:text-amber-300 sm:text-xl">
+            <h1 className="text-lg font-bold tracking-tight text-emerald-950 dark:text-amber-300 sm:text-xl whitespace-nowrap">
               Mukwano-Rafiki
             </h1>
-            <p className="text-xs text-stone-600 dark:text-stone-300 sm:text-sm">
-              Your friend between languages.
-            </p>
           </div>
 
           {/* Desktop Navigation */}
@@ -158,6 +226,17 @@ export default function App() {
           >
             <button
               type="button"
+              onClick={() => setView('chat')}
+              className={`min-h-[44px] px-1 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
+                view === 'chat'
+                  ? 'border-emerald-800 text-emerald-900 dark:border-amber-400 dark:text-amber-300'
+                  : 'border-transparent text-stone-600 hover:text-stone-900 dark:text-stone-300 dark:hover:text-white'
+              }`}
+            >
+              Chat
+            </button>
+            <button
+              type="button"
               onClick={() => setView('translate')}
               className={`min-h-[44px] px-1 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
                 view === 'translate'
@@ -165,7 +244,7 @@ export default function App() {
                   : 'border-transparent text-stone-600 hover:text-stone-900 dark:text-stone-300 dark:hover:text-white'
               }`}
             >
-              Translate
+              Translator
             </button>
             <button
               type="button"
@@ -187,7 +266,7 @@ export default function App() {
                   : 'border-transparent text-stone-600 hover:text-stone-900 dark:text-stone-300 dark:hover:text-white'
               }`}
             >
-              Accuracy &amp; reports
+              Results
             </button>
           </nav>
 
@@ -222,14 +301,30 @@ export default function App() {
           >
             <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
             <span>
-              Browser storage is full or disabled. Ratings and results remain active in this tab—export CSV before closing.
+              Browser storage is full or disabled. Data remains active in this tab—export CSV before closing.
             </span>
           </div>
+        )}
+
+        {view === 'chat' && (
+          <ChatView
+            profile={profile}
+            messages={chatMessages}
+            onSaveProfile={handleSaveProfile}
+            onAddMessages={handleAddChatMessages}
+            onNewConversation={handleNewConversation}
+            onClearPersonalData={handleClearPersonalData}
+            onSubmitBadReplyReport={handleSubmitBadReplyReport}
+            onTranslateReply={handleTranslateReply}
+            onNavigateToResults={() => setView('results')}
+          />
         )}
 
         {view === 'translate' && (
           <TranslatorView
             history={history}
+            initialText={pendingTranslateText}
+            onConsumeInitialText={() => setPendingTranslateText(null)}
             onTranslationSuccess={handleTranslationSuccess}
             onClearHistory={handleClearHistory}
             onSubmitReport={handleSubmitReport}
@@ -239,23 +334,25 @@ export default function App() {
 
         {view === 'test' && (
           <TestModeView
+            chatEvaluations={chatEvaluations}
             evaluations={evaluations}
-            voiceEvaluations={voiceEvaluations}
             modelConfig={modelConfig}
+            onUpdateChatEvaluation={handleUpdateChatEvaluation}
             onUpdateEvaluation={handleUpdateEvaluation}
-            onUpdateVoiceEvaluation={handleUpdateVoiceEvaluation}
+            onResetChatEvaluations={handleResetChatEvaluations}
             onResetEvaluations={handleResetEvaluations}
-            onResetVoiceEvaluations={handleResetVoiceEvaluations}
             onNavigateToResults={() => setView('results')}
           />
         )}
 
         {view === 'results' && (
           <ResultsView
+            chatEvaluations={chatEvaluations}
+            badReplyReports={badReplyReports}
             evaluations={evaluations}
-            voiceEvaluations={voiceEvaluations}
             reports={reports}
             modelConfig={modelConfig}
+            onDeleteBadReplyReport={handleDeleteBadReplyReport}
             onDeleteReport={handleDeleteReport}
             onNavigateToTest={() => setView('test')}
           />
@@ -265,15 +362,28 @@ export default function App() {
       {/* Footer Note */}
       <footer className="border-t border-stone-200/80 bg-white/60 px-4 py-4 text-center text-xs text-stone-600 dark:border-emerald-950/80 dark:bg-[#111915]/60 dark:text-stone-400 sm:px-6">
         <p className="mx-auto max-w-3xl leading-relaxed">
-          Translations may contain errors. Please verify important text with a native speaker.
+          Mukwano-Rafiki gives general advice, not professional medical, legal or financial advice.
         </p>
       </footer>
 
       {/* Mobile Fixed Bottom Thumb Navigation (< md, 64px <= 15% mobile viewport cap) */}
       <nav
         aria-label="Mobile navigation"
-        className="fixed bottom-0 left-0 right-0 z-40 grid h-16 grid-cols-3 border-t border-stone-200 bg-white/95 backdrop-blur-md dark:border-emerald-950 dark:bg-[#111915]/95 md:hidden"
+        className="fixed bottom-0 left-0 right-0 z-40 grid h-16 grid-cols-4 border-t border-stone-200 bg-white/95 backdrop-blur-md dark:border-emerald-950 dark:bg-[#111915]/95 md:hidden"
       >
+        <button
+          type="button"
+          onClick={() => setView('chat')}
+          className={`flex flex-col items-center justify-center gap-1 text-[11px] font-semibold transition-colors ${
+            view === 'chat'
+              ? 'text-emerald-800 dark:text-amber-300'
+              : 'text-stone-500 dark:text-stone-400'
+          }`}
+        >
+          <MessageCircle className="h-5 w-5" aria-hidden="true" />
+          <span>Chat</span>
+        </button>
+
         <button
           type="button"
           onClick={() => setView('translate')}
@@ -284,7 +394,7 @@ export default function App() {
           }`}
         >
           <Languages className="h-5 w-5" aria-hidden="true" />
-          <span>Translate</span>
+          <span>Translator</span>
         </button>
 
         <button

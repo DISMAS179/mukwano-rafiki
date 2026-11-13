@@ -1,21 +1,26 @@
 import { useMemo } from 'react';
 import { Download, Trash2 } from 'lucide-react';
+import { CHAT_TEST_CASES } from '../data/chatTestCases';
 import { TEST_PHRASES } from '../data/testPhrases';
 import type {
+  BadReplyReport,
   BadTranslationReport,
+  ChatCriterionRating,
+  ChatTestEvaluation,
   LanguageName,
   ModelChoice,
   TestPhraseEvaluation,
-  VoiceTestEvaluation,
 } from '../types';
 import { DEFAULT_MODEL_CONFIG, type ServerHealthConfig } from '../utils/api';
 import { buildCsvExport, downloadCsv } from '../utils/csv';
 
 interface ResultsViewProps {
+  chatEvaluations: Record<string, ChatTestEvaluation>;
+  badReplyReports: BadReplyReport[];
   evaluations: Record<string, TestPhraseEvaluation>;
-  voiceEvaluations: Record<string, VoiceTestEvaluation>;
   reports: BadTranslationReport[];
   modelConfig?: ServerHealthConfig;
+  onDeleteBadReplyReport: (id: string) => void;
   onDeleteReport: (id: string) => void;
   onNavigateToTest: () => void;
 }
@@ -28,11 +33,17 @@ interface ScoreBucket {
   accuracyPct: number | null;
 }
 
+interface ChatCriterionBucket {
+  yes: number;
+  partly: number;
+  no: number;
+  totalRated: number;
+  yesPct: number | null;
+}
+
 interface LanguageStats {
   language: LanguageName;
   textTranslation: ScoreBucket;
-  voiceTranscript: ScoreBucket;
-  voiceTranslation: ScoreBucket;
 }
 
 interface ModelComparisonRow {
@@ -40,8 +51,9 @@ interface ModelComparisonRow {
   label: string;
   modelId: string;
   overall: ScoreBucket;
-  voiceOverall: ScoreBucket;
   byLanguage: Record<LanguageName, ScoreBucket>;
+  chatUnderstood: ChatCriterionBucket;
+  chatSafe: ChatCriterionBucket;
 }
 
 const LANGUAGES: LanguageName[] = ['Luganda', 'Swahili', 'English'];
@@ -56,12 +68,33 @@ function emptyBucket(): ScoreBucket {
   };
 }
 
+function emptyChatBucket(): ChatCriterionBucket {
+  return {
+    yes: 0,
+    partly: 0,
+    no: 0,
+    totalRated: 0,
+    yesPct: null,
+  };
+}
+
 function recordScore(bucket: ScoreBucket, rating: string | undefined) {
   if (!rating) return;
   bucket.totalRated += 1;
   if (rating === 'correct') bucket.correct += 1;
   else if (rating === 'understandable') bucket.understandable += 1;
   else if (rating === 'wrong') bucket.wrong += 1;
+}
+
+function recordChatCriterion(
+  bucket: ChatCriterionBucket,
+  rating: ChatCriterionRating | undefined,
+) {
+  if (!rating) return;
+  bucket.totalRated += 1;
+  if (rating === 'yes') bucket.yes += 1;
+  else if (rating === 'partly') bucket.partly += 1;
+  else if (rating === 'no') bucket.no += 1;
 }
 
 function finalizeBucket(bucket: ScoreBucket): ScoreBucket {
@@ -72,26 +105,40 @@ function finalizeBucket(bucket: ScoreBucket): ScoreBucket {
   };
 }
 
+function finalizeChatBucket(bucket: ChatCriterionBucket): ChatCriterionBucket {
+  return {
+    ...bucket,
+    yesPct: bucket.totalRated > 0 ? Math.round((bucket.yes / bucket.totalRated) * 100) : null,
+  };
+}
+
 function formatScoreCell(bucket: ScoreBucket): string {
   if (bucket.totalRated === 0 || bucket.accuracyPct === null) return '—';
   return `${bucket.accuracyPct}% (${bucket.correct}/${bucket.totalRated})`;
 }
 
+function formatChatCell(bucket: ChatCriterionBucket): string {
+  if (bucket.totalRated === 0 || bucket.yesPct === null) return '—';
+  return `${bucket.yesPct}% (${bucket.yes}/${bucket.totalRated})`;
+}
+
 export function ResultsView({
+  chatEvaluations,
+  badReplyReports,
   evaluations,
-  voiceEvaluations,
   reports,
   modelConfig = DEFAULT_MODEL_CONFIG,
+  onDeleteBadReplyReport,
   onDeleteReport,
   onNavigateToTest,
 }: ResultsViewProps) {
   const phraseMap = useMemo(() => new Map(TEST_PHRASES.map((p) => [p.id, p])), []);
+  const chatCaseMap = useMemo(() => new Map(CHAT_TEST_CASES.map((c) => [c.id, c])), []);
 
   const modelMeta = useMemo<Array<{ choice: ModelChoice; label: string; modelId: string }>>(
     () => [
-      { choice: 'primary', label: 'Gemma 26B', modelId: modelConfig.primaryModel },
-      { choice: 'alternative', label: 'Gemma 31B', modelId: modelConfig.alternativeModel },
-      { choice: 'fallback', label: 'Gemini Flash', modelId: modelConfig.fallbackModel },
+      { choice: 'primary', label: 'Gemini Primary', modelId: modelConfig.primaryModel },
+      { choice: 'secondary', label: 'Gemini Secondary', modelId: modelConfig.secondaryModel },
     ],
     [modelConfig],
   );
@@ -99,28 +146,22 @@ export function ResultsView({
   const {
     perLanguage,
     overallText,
-    overallVoiceTranscript,
-    overallVoiceTranslation,
     modelComparison,
+    chatCriteriaOverall,
+    totalChatRatedScenarios,
   } = useMemo(() => {
     const map: Record<LanguageName, LanguageStats> = {
       Luganda: {
         language: 'Luganda',
         textTranslation: emptyBucket(),
-        voiceTranscript: emptyBucket(),
-        voiceTranslation: emptyBucket(),
       },
       Swahili: {
         language: 'Swahili',
         textTranslation: emptyBucket(),
-        voiceTranscript: emptyBucket(),
-        voiceTranslation: emptyBucket(),
       },
       English: {
         language: 'English',
         textTranslation: emptyBucket(),
-        voiceTranscript: emptyBucket(),
-        voiceTranslation: emptyBucket(),
       },
     };
 
@@ -128,38 +169,61 @@ export function ResultsView({
       ModelChoice,
       {
         overall: ScoreBucket;
-        voiceOverall: ScoreBucket;
         byLanguage: Record<LanguageName, ScoreBucket>;
+        chatUnderstood: ChatCriterionBucket;
+        chatSafe: ChatCriterionBucket;
       }
     > = {
       primary: {
         overall: emptyBucket(),
-        voiceOverall: emptyBucket(),
         byLanguage: {
           Luganda: emptyBucket(),
           Swahili: emptyBucket(),
           English: emptyBucket(),
         },
+        chatUnderstood: emptyChatBucket(),
+        chatSafe: emptyChatBucket(),
       },
-      alternative: {
+      secondary: {
         overall: emptyBucket(),
-        voiceOverall: emptyBucket(),
         byLanguage: {
           Luganda: emptyBucket(),
           Swahili: emptyBucket(),
           English: emptyBucket(),
         },
-      },
-      fallback: {
-        overall: emptyBucket(),
-        voiceOverall: emptyBucket(),
-        byLanguage: {
-          Luganda: emptyBucket(),
-          Swahili: emptyBucket(),
-          English: emptyBucket(),
-        },
+        chatUnderstood: emptyChatBucket(),
+        chatSafe: emptyChatBucket(),
       },
     };
+
+    const chatBuckets = {
+      understoodMe: emptyChatBucket(),
+      naturalLanguage: emptyChatBucket(),
+      helpfulAdvice: emptyChatBucket(),
+      safe: emptyChatBucket(),
+    };
+    let ratedChatCount = 0;
+
+    for (const chatEv of Object.values(chatEvaluations)) {
+      const testCase = chatCaseMap.get(chatEv.caseId);
+      if (!testCase) continue;
+      if (
+        chatEv.understoodMe ||
+        chatEv.naturalLanguage ||
+        chatEv.helpfulAdvice ||
+        chatEv.safe
+      ) {
+        ratedChatCount += 1;
+      }
+      recordChatCriterion(chatBuckets.understoodMe, chatEv.understoodMe);
+      recordChatCriterion(chatBuckets.naturalLanguage, chatEv.naturalLanguage);
+      recordChatCriterion(chatBuckets.helpfulAdvice, chatEv.helpfulAdvice);
+      recordChatCriterion(chatBuckets.safe, chatEv.safe);
+
+      const choice: ModelChoice = chatEv.modelChoice === 'secondary' ? 'secondary' : 'primary';
+      recordChatCriterion(modelBuckets[choice].chatUnderstood, chatEv.understoodMe);
+      recordChatCriterion(modelBuckets[choice].chatSafe, chatEv.safe);
+    }
 
     for (const textEv of Object.values(evaluations)) {
       if (!textEv.rating) continue;
@@ -168,30 +232,21 @@ export function ResultsView({
 
       recordScore(map[phrase.sourceLanguage].textTranslation, textEv.rating);
 
-      const choice: ModelChoice = textEv.modelChoice ?? 'primary';
-      recordScore(modelBuckets[choice].overall, textEv.rating);
-      recordScore(modelBuckets[choice].byLanguage[phrase.sourceLanguage], textEv.rating);
-    }
-
-    for (const voiceEv of Object.values(voiceEvaluations)) {
-      const phrase = phraseMap.get(voiceEv.phraseId);
-      if (!phrase) continue;
-
-      if (voiceEv.transcriptRating) {
-        recordScore(map[phrase.sourceLanguage].voiceTranscript, voiceEv.transcriptRating);
-      }
-      if (voiceEv.translationRating) {
-        recordScore(map[phrase.sourceLanguage].voiceTranslation, voiceEv.translationRating);
-        const choice: ModelChoice = voiceEv.modelChoice ?? 'primary';
-        recordScore(modelBuckets[choice].voiceOverall, voiceEv.translationRating);
+      const choice: ModelChoice | null =
+        textEv.modelChoice === 'secondary'
+          ? 'secondary'
+          : !textEv.modelChoice || textEv.modelChoice === 'primary'
+            ? 'primary'
+            : null;
+      if (choice) {
+        recordScore(modelBuckets[choice].overall, textEv.rating);
+        recordScore(modelBuckets[choice].byLanguage[phrase.sourceLanguage], textEv.rating);
       }
     }
 
     const list = LANGUAGES.map((lang) => ({
       language: lang,
       textTranslation: finalizeBucket(map[lang].textTranslation),
-      voiceTranscript: finalizeBucket(map[lang].voiceTranscript),
-      voiceTranslation: finalizeBucket(map[lang].voiceTranslation),
     }));
 
     const sumBuckets = (picker: (s: LanguageStats) => ScoreBucket): ScoreBucket => {
@@ -211,22 +266,41 @@ export function ResultsView({
       label: meta.label,
       modelId: meta.modelId,
       overall: finalizeBucket(modelBuckets[meta.choice].overall),
-      voiceOverall: finalizeBucket(modelBuckets[meta.choice].voiceOverall),
       byLanguage: {
         Luganda: finalizeBucket(modelBuckets[meta.choice].byLanguage.Luganda),
         Swahili: finalizeBucket(modelBuckets[meta.choice].byLanguage.Swahili),
         English: finalizeBucket(modelBuckets[meta.choice].byLanguage.English),
       },
+      chatUnderstood: finalizeChatBucket(modelBuckets[meta.choice].chatUnderstood),
+      chatSafe: finalizeChatBucket(modelBuckets[meta.choice].chatSafe),
     }));
 
     return {
       perLanguage: list,
       overallText: sumBuckets((s) => s.textTranslation),
-      overallVoiceTranscript: sumBuckets((s) => s.voiceTranscript),
-      overallVoiceTranslation: sumBuckets((s) => s.voiceTranslation),
       modelComparison: comparisonRows,
+      chatCriteriaOverall: {
+        understoodMe: finalizeChatBucket(chatBuckets.understoodMe),
+        naturalLanguage: finalizeChatBucket(chatBuckets.naturalLanguage),
+        helpfulAdvice: finalizeChatBucket(chatBuckets.helpfulAdvice),
+        safe: finalizeChatBucket(chatBuckets.safe),
+      },
+      totalChatRatedScenarios: ratedChatCount,
     };
-  }, [evaluations, voiceEvaluations, phraseMap, modelMeta]);
+  }, [chatEvaluations, evaluations, phraseMap, chatCaseMap, modelMeta]);
+
+  const chatBetterReplies = useMemo(() => {
+    return Object.values(chatEvaluations)
+      .filter((ev) => Boolean(ev.betterReply && ev.betterReply.trim().length > 0))
+      .map((ev) => ({
+        testCase: chatCaseMap.get(ev.caseId),
+        evaluation: ev,
+      }))
+      .filter(
+        (item): item is { testCase: NonNullable<typeof item.testCase>; evaluation: ChatTestEvaluation } =>
+          Boolean(item.testCase),
+      );
+  }, [chatEvaluations, chatCaseMap]);
 
   const testSuggestions = useMemo(() => {
     return Object.values(evaluations)
@@ -240,42 +314,34 @@ export function ResultsView({
       );
   }, [evaluations, phraseMap]);
 
-  const voiceSuggestions = useMemo(() => {
-    return Object.values(voiceEvaluations)
-      .filter(
-        (ev) =>
-          Boolean(ev.suggestedTranscriptFix && ev.suggestedTranscriptFix.trim().length > 0) ||
-          Boolean(ev.suggestedTranslationFix && ev.suggestedTranslationFix.trim().length > 0),
-      )
-      .map((ev) => ({
-        phrase: phraseMap.get(ev.phraseId),
-        evaluation: ev,
-      }))
-      .filter((item): item is { phrase: NonNullable<typeof item.phrase>; evaluation: VoiceTestEvaluation } =>
-        Boolean(item.phrase),
-      );
-  }, [voiceEvaluations, phraseMap]);
-
   const hasExportableData =
+    totalChatRatedScenarios > 0 ||
+    badReplyReports.length > 0 ||
+    Object.values(chatEvaluations).some((ev) => Boolean(ev.reply || ev.betterReply)) ||
     overallText.totalRated > 0 ||
-    overallVoiceTranscript.totalRated > 0 ||
-    overallVoiceTranslation.totalRated > 0 ||
     reports.length > 0 ||
-    Object.values(evaluations).some((ev) => Boolean(ev.output || ev.suggestedFix)) ||
-    Object.values(voiceEvaluations).some((ev) =>
-      Boolean(
-        ev.transcript ||
-          ev.output ||
-          ev.suggestedTranscriptFix ||
-          ev.suggestedTranslationFix,
-      ),
-    );
+    Object.values(evaluations).some((ev) => Boolean(ev.output || ev.suggestedFix));
 
   function handleExportCsv() {
-    const csv = buildCsvExport(TEST_PHRASES, evaluations, voiceEvaluations, reports, modelConfig);
+    const csv = buildCsvExport({
+      chatCases: CHAT_TEST_CASES,
+      chatEvaluations,
+      badReplyReports,
+      phrases: TEST_PHRASES,
+      evaluations,
+      reports,
+      modelConfig,
+    });
     const dateStamp = new Date().toISOString().slice(0, 10);
     downloadCsv(`mukwano-rafiki-feedback-${dateStamp}.csv`, csv);
   }
+
+  const chatCriteriaCards = [
+    { key: 'understoodMe', title: 'Understood me', bucket: chatCriteriaOverall.understoodMe },
+    { key: 'naturalLanguage', title: 'Natural language', bucket: chatCriteriaOverall.naturalLanguage },
+    { key: 'helpfulAdvice', title: 'Helpful advice', bucket: chatCriteriaOverall.helpfulAdvice },
+    { key: 'safe', title: 'Safe', bucket: chatCriteriaOverall.safe },
+  ];
 
   return (
     <div className="space-y-6">
@@ -284,14 +350,14 @@ export function ResultsView({
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h2 className="text-xl font-bold text-stone-900 dark:text-stone-50">
-              Accuracy &amp; Feedback Results
+              Quality &amp; Feedback Results
             </h2>
             <p className="mt-1 text-sm text-stone-600 dark:text-stone-300">
-              Accuracy score is calculated as{' '}
+              Chatbot evaluation scores ({' '}
               <span className="font-medium text-stone-900 dark:text-stone-100">
-                Correct ÷ Total rated
+                Yes ÷ Total rated
               </span>{' '}
-              across models and languages.
+              ) alongside Translator accuracy across models and languages.
             </p>
           </div>
 
@@ -306,18 +372,58 @@ export function ResultsView({
           </button>
         </div>
 
-        {/* Accuracy Per Model & Per Language Comparison */}
+        {/* Chatbot Quality Scores */}
         <div className="mt-6">
+          <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+            <h3 className="text-sm font-bold text-stone-800 dark:text-stone-200">
+              Chatbot test quality scores
+            </h3>
+            <span className="text-xs text-stone-500 dark:text-stone-400 tabular-nums">
+              {totalChatRatedScenarios} scenario evaluation{totalChatRatedScenarios === 1 ? '' : 's'}
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {chatCriteriaCards.map((item) => (
+              <div
+                key={item.key}
+                className={`rounded-2xl border p-4 ${
+                  item.key === 'safe'
+                    ? 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-900/70 dark:bg-emerald-950/30'
+                    : 'border-stone-200 bg-[#FAF9F5] dark:border-emerald-950/80 dark:bg-[#0D1310]'
+                }`}
+              >
+                <p className="text-xs font-semibold text-stone-700 dark:text-stone-200">
+                  {item.title}
+                </p>
+                <p className="mt-2 font-mono text-3xl font-bold tabular-nums text-stone-900 dark:text-stone-50">
+                  {item.bucket.yesPct !== null ? `${item.bucket.yesPct}%` : '—'}
+                </p>
+                <p className="mt-1 text-xs text-stone-600 dark:text-stone-400 tabular-nums">
+                  {item.bucket.yes} / {item.bucket.totalRated} rated Yes
+                </p>
+                <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-stone-200/80 pt-2 text-[11px] text-stone-500 dark:border-emerald-950/70 dark:text-stone-400 tabular-nums">
+                  <span>Partly: {item.bucket.partly}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>No: {item.bucket.no}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Accuracy Per Model & Per Language Comparison */}
+        <div className="mt-7 border-t border-stone-100 pt-6 dark:border-emerald-950/70">
           <h3 className="mb-3 text-sm font-bold text-stone-800 dark:text-stone-200">
-            Model comparison (per model &amp; per language)
+            Model comparison (chatbot &amp; translator)
           </h3>
           <div className="overflow-x-auto rounded-xl border border-stone-200 dark:border-emerald-950/80">
             <table className="w-full border-collapse text-left text-sm">
               <thead>
                 <tr className="border-b border-stone-200 bg-[#FAF9F5] text-xs font-semibold text-stone-600 dark:border-emerald-950/80 dark:bg-[#0D1310] dark:text-stone-300">
                   <th className="px-4 py-3">Model</th>
-                  <th className="px-4 py-3">Text overall</th>
-                  <th className="px-4 py-3">Voice translation</th>
+                  <th className="px-4 py-3">Chat understood</th>
+                  <th className="px-4 py-3">Chat safe</th>
+                  <th className="px-4 py-3">Text translation</th>
                   <th className="px-4 py-3">Luganda</th>
                   <th className="px-4 py-3">Swahili</th>
                   <th className="px-4 py-3">English</th>
@@ -335,10 +441,13 @@ export function ResultsView({
                       </div>
                     </td>
                     <td className="px-4 py-3 font-mono text-xs font-semibold text-emerald-900 dark:text-emerald-300">
-                      {formatScoreCell(row.overall)}
+                      {formatChatCell(row.chatUnderstood)}
                     </td>
-                    <td className="px-4 py-3 font-mono text-xs font-semibold text-amber-800 dark:text-amber-300">
-                      {formatScoreCell(row.voiceOverall)}
+                    <td className="px-4 py-3 font-mono text-xs font-semibold text-emerald-900 dark:text-emerald-300">
+                      {formatChatCell(row.chatSafe)}
+                    </td>
+                    <td className="px-4 py-3 font-mono text-xs font-semibold text-stone-800 dark:text-stone-200">
+                      {formatScoreCell(row.overall)}
                     </td>
                     <td className="px-4 py-3 font-mono text-xs text-stone-700 dark:text-stone-300">
                       {formatScoreCell(row.byLanguage.Luganda)}
@@ -359,7 +468,7 @@ export function ResultsView({
         {/* Text Test Combined Accuracy Cards */}
         <div className="mt-7 border-t border-stone-100 pt-6 dark:border-emerald-950/70">
           <h3 className="mb-3 text-sm font-bold text-stone-800 dark:text-stone-200">
-            Combined text translation accuracy
+            Translator text accuracy
           </h3>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <div className="rounded-2xl border border-emerald-200 bg-emerald-50/70 p-4 dark:border-emerald-900/70 dark:bg-emerald-950/30">
@@ -400,93 +509,95 @@ export function ResultsView({
           </div>
         </div>
 
-        {/* Voice Test Accuracy Cards (Separate Transcript & Translation Scores) */}
-        <div className="mt-7 border-t border-stone-100 pt-6 dark:border-emerald-950/70">
-          <h3 className="mb-3 text-sm font-bold text-stone-800 dark:text-stone-200">
-            Voice test accuracy (transcript vs. translation)
-          </h3>
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <div className="rounded-2xl border border-amber-200 bg-amber-50/70 p-4 dark:border-amber-900/60 dark:bg-amber-950/20">
-              <p className="text-xs font-semibold text-amber-900 dark:text-amber-300">
-                Overall voice scores
-              </p>
-              <div className="mt-3 space-y-2 tabular-nums">
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-xs text-stone-600 dark:text-stone-300">Transcript:</span>
-                  <span className="font-mono text-lg font-bold text-stone-900 dark:text-stone-50">
-                    {overallVoiceTranscript.accuracyPct !== null
-                      ? `${overallVoiceTranscript.accuracyPct}%`
-                      : '—'}{' '}
-                    <span className="text-xs font-normal text-stone-500 dark:text-stone-400">
-                      ({overallVoiceTranscript.correct}/{overallVoiceTranscript.totalRated})
-                    </span>
-                  </span>
-                </div>
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-xs text-stone-600 dark:text-stone-300">Translation:</span>
-                  <span className="font-mono text-lg font-bold text-stone-900 dark:text-stone-50">
-                    {overallVoiceTranslation.accuracyPct !== null
-                      ? `${overallVoiceTranslation.accuracyPct}%`
-                      : '—'}{' '}
-                    <span className="text-xs font-normal text-stone-500 dark:text-stone-400">
-                      ({overallVoiceTranslation.correct}/{overallVoiceTranslation.totalRated})
-                    </span>
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            {perLanguage.map((stat) => (
-              <div
-                key={`voice-${stat.language}`}
-                className="rounded-2xl border border-stone-200 bg-[#FAF9F5] p-4 dark:border-emerald-950/80 dark:bg-[#0D1310]"
-              >
-                <p className="text-xs font-semibold text-stone-600 dark:text-stone-300">
-                  {stat.language} voice
-                </p>
-                <div className="mt-3 space-y-2 tabular-nums">
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="text-xs text-stone-500 dark:text-stone-400">Transcript:</span>
-                    <span className="font-mono text-lg font-bold text-stone-900 dark:text-stone-50">
-                      {stat.voiceTranscript.accuracyPct !== null
-                        ? `${stat.voiceTranscript.accuracyPct}%`
-                        : '—'}{' '}
-                      <span className="text-xs font-normal text-stone-500 dark:text-stone-400">
-                        ({stat.voiceTranscript.correct}/{stat.voiceTranscript.totalRated})
-                      </span>
-                    </span>
-                  </div>
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="text-xs text-stone-500 dark:text-stone-400">Translation:</span>
-                    <span className="font-mono text-lg font-bold text-stone-900 dark:text-stone-50">
-                      {stat.voiceTranslation.accuracyPct !== null
-                        ? `${stat.voiceTranslation.accuracyPct}%`
-                        : '—'}{' '}
-                      <span className="text-xs font-normal text-stone-500 dark:text-stone-400">
-                        ({stat.voiceTranslation.correct}/{stat.voiceTranslation.totalRated})
-                      </span>
-                    </span>
-                  </div>
-                </div>
-              </div>
-            ))}
+        {totalChatRatedScenarios === 0 && overallText.totalRated === 0 && (
+          <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-stone-200 bg-[#FAF9F5] px-4 py-3 text-sm text-stone-700 dark:border-emerald-950/80 dark:bg-[#0D1310] dark:text-stone-300">
+            <span>No chatbot scenarios or translator phrases have been rated yet.</span>
+            <button
+              type="button"
+              onClick={onNavigateToTest}
+              className="min-h-[36px] font-semibold text-emerald-800 underline underline-offset-4 hover:text-emerald-950 dark:text-amber-300"
+            >
+              Go to Test mode
+            </button>
           </div>
+        )}
+      </section>
+
+      {/* Saved Bad Reply Reports from Chat */}
+      <section className="rounded-2xl border border-stone-200/90 bg-white p-4 shadow-sm dark:border-emerald-950/90 dark:bg-[#141D18] sm:p-6">
+        <div className="border-b border-stone-100 pb-3 dark:border-emerald-950/70">
+          <h3 className="text-lg font-bold text-stone-900 dark:text-stone-50">
+            Saved bad reply reports ({badReplyReports.length})
+          </h3>
+          <p className="mt-0.5 text-xs text-stone-500 dark:text-stone-400">
+            Feedback submitted directly from the Mukwano-Rafiki chatbot.
+          </p>
         </div>
 
-        {overallText.totalRated === 0 &&
-          overallVoiceTranscript.totalRated === 0 &&
-          overallVoiceTranslation.totalRated === 0 && (
-            <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-stone-200 bg-[#FAF9F5] px-4 py-3 text-sm text-stone-700 dark:border-emerald-950/80 dark:bg-[#0D1310] dark:text-stone-300">
-              <span>No test phrases (text or voice) have been rated yet.</span>
-              <button
-                type="button"
-                onClick={onNavigateToTest}
-                className="min-h-[36px] font-semibold text-emerald-800 underline underline-offset-4 hover:text-emerald-950 dark:text-amber-300"
-              >
-                Go to Test mode
-              </button>
-            </div>
-          )}
+        {badReplyReports.length === 0 ? (
+          <p className="py-6 text-sm text-stone-500 dark:text-stone-400">
+            No bad reply reports saved yet. Use “Report bad reply” under any assistant bubble in Chat to log what would have helped more.
+          </p>
+        ) : (
+          <ul className="divide-y divide-stone-100 dark:divide-emerald-950/70">
+            {badReplyReports.map((item) => (
+              <li key={item.id} className="py-4 first:pt-3 last:pb-1">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="space-y-1.5 text-sm">
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
+                      <span className="font-semibold text-emerald-900 dark:text-emerald-300">
+                        {item.detectedLanguage || 'Mixed'}
+                      </span>
+                      {item.detectedEmotion && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span>Tone: {item.detectedEmotion}</span>
+                        </>
+                      )}
+                      {item.model_used && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="font-mono">{item.model_used}</span>
+                        </>
+                      )}
+                      <span aria-hidden="true">·</span>
+                      <span className="font-mono tabular-nums">
+                        {new Date(item.timestamp).toLocaleDateString()}
+                      </span>
+                    </div>
+                    {item.userMessage && (
+                      <p className="text-stone-800 dark:text-stone-200">
+                        <span className="font-semibold text-stone-500 dark:text-stone-400">
+                          User:{' '}
+                        </span>
+                        {item.userMessage}
+                      </p>
+                    )}
+                    <p className="text-stone-600 dark:text-stone-400">
+                      <span className="font-semibold text-rose-700 dark:text-rose-400">
+                        Chatbot reply:{' '}
+                      </span>
+                      {item.botReply}
+                    </p>
+                    <p className="font-medium text-emerald-900 dark:text-emerald-300">
+                      <span className="font-semibold">Suggested better reply: </span>
+                      {item.suggestedBetterReply}
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => onDeleteBadReplyReport(item.id)}
+                    aria-label="Delete bad reply report"
+                    className="inline-flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-xl text-stone-400 hover:bg-stone-100 hover:text-rose-700 dark:hover:bg-emerald-950/60 dark:hover:text-rose-300"
+                  >
+                    <Trash2 className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       {/* Saved Bad Translation Reports */}
@@ -496,13 +607,13 @@ export function ResultsView({
             Saved bad translation reports ({reports.length})
           </h3>
           <p className="mt-0.5 text-xs text-stone-500 dark:text-stone-400">
-            Corrections submitted from the main translator.
+            Corrections submitted from the Translator tab.
           </p>
         </div>
 
         {reports.length === 0 ? (
           <p className="py-6 text-sm text-stone-500 dark:text-stone-400">
-            No bad translation reports saved yet. Use “Report bad translation” on any result card to log a better phrasing.
+            No bad translation reports saved yet. Use “Report bad translation” on any translator result card to log a better phrasing.
           </p>
         ) : (
           <ul className="divide-y divide-stone-100 dark:divide-emerald-950/70">
@@ -560,19 +671,50 @@ export function ResultsView({
         )}
       </section>
 
-      {/* Native Speaker Better Versions from Text & Voice Test Mode */}
-      {(testSuggestions.length > 0 || voiceSuggestions.length > 0) && (
+      {/* Native Speaker Better Versions from Test Mode */}
+      {(chatBetterReplies.length > 0 || testSuggestions.length > 0) && (
         <section className="rounded-2xl border border-stone-200/90 bg-white p-4 shadow-sm dark:border-emerald-950/90 dark:bg-[#141D18] sm:p-6">
           <div className="border-b border-stone-100 pb-3 dark:border-emerald-950/70">
             <h3 className="text-lg font-bold text-stone-900 dark:text-stone-50">
-              Test mode native speaker corrections ({testSuggestions.length + voiceSuggestions.length})
+              Test mode native speaker corrections (
+              {chatBetterReplies.length + testSuggestions.length})
             </h3>
           </div>
           <ul className="divide-y divide-stone-100 dark:divide-emerald-950/70">
+            {chatBetterReplies.map(({ testCase, evaluation }) => (
+              <li
+                key={`chat-${evaluation.modelChoice ?? 'primary'}-${testCase.id}`}
+                className="space-y-1 py-3.5 text-sm"
+              >
+                <div className="flex flex-wrap items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
+                  <span className="font-semibold text-emerald-900 dark:text-emerald-300">
+                    Chatbot · {testCase.caseType}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>{testCase.languageHint}</span>
+                  {evaluation.modelUsed && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span className="font-mono">{evaluation.modelUsed}</span>
+                    </>
+                  )}
+                </div>
+                <p className="text-stone-800 dark:text-stone-200">{testCase.message}</p>
+                {evaluation.reply && (
+                  <p className="text-xs text-stone-500 dark:text-stone-400">
+                    Chatbot reply: {evaluation.reply}
+                  </p>
+                )}
+                <p className="font-medium text-emerald-900 dark:text-emerald-300">
+                  Better reply: {evaluation.betterReply}
+                </p>
+              </li>
+            ))}
+
             {testSuggestions.map(({ phrase, evaluation }) => (
               <li
                 key={`txt-${evaluation.modelChoice ?? 'primary'}-${phrase.id}`}
-                className="py-3.5 text-sm space-y-1"
+                className="space-y-1 py-3.5 text-sm"
               >
                 <div className="flex flex-wrap items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
                   <span className="font-semibold text-emerald-900 dark:text-emerald-300">
@@ -596,48 +738,6 @@ export function ResultsView({
                 <p className="font-medium text-emerald-900 dark:text-emerald-300">
                   Better version: {evaluation.suggestedFix}
                 </p>
-              </li>
-            ))}
-
-            {voiceSuggestions.map(({ phrase, evaluation }) => (
-              <li
-                key={`vc-${evaluation.modelChoice ?? 'primary'}-${phrase.id}`}
-                className="py-3.5 text-sm space-y-1"
-              >
-                <div className="flex flex-wrap items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
-                  <span className="font-semibold text-amber-800 dark:text-amber-300">
-                    Voice · {phrase.sourceLanguage} → {phrase.targetLanguage}
-                  </span>
-                  <span aria-hidden="true">·</span>
-                  <span>{phrase.category}</span>
-                  {evaluation.modelUsed && (
-                    <>
-                      <span aria-hidden="true">·</span>
-                      <span className="font-mono">{evaluation.modelUsed}</span>
-                    </>
-                  )}
-                </div>
-                <p className="text-stone-800 dark:text-stone-200">{phrase.phrase}</p>
-                {evaluation.transcript && (
-                  <p className="text-xs text-stone-500 dark:text-stone-400">
-                    Transcript: {evaluation.transcript}
-                  </p>
-                )}
-                {evaluation.suggestedTranscriptFix && (
-                  <p className="font-medium text-amber-900 dark:text-amber-300">
-                    Better transcript: {evaluation.suggestedTranscriptFix}
-                  </p>
-                )}
-                {evaluation.output && (
-                  <p className="text-xs text-stone-500 dark:text-stone-400">
-                    Translation: {evaluation.output}
-                  </p>
-                )}
-                {evaluation.suggestedTranslationFix && (
-                  <p className="font-medium text-emerald-900 dark:text-emerald-300">
-                    Better translation: {evaluation.suggestedTranslationFix}
-                  </p>
-                )}
               </li>
             ))}
           </ul>

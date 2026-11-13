@@ -5,65 +5,88 @@ import {
   ChevronDown,
   ChevronUp,
   Loader2,
-  Mic,
   Play,
-  RefreshCw,
   RotateCcw,
-  Square,
   X,
 } from 'lucide-react';
+import { MessageCircle } from 'lucide-react';
+import { CHAT_TEST_CASES } from '../data/chatTestCases';
 import { TEST_PHRASES } from '../data/testPhrases';
 import type {
+  ChatCaseType,
+  ChatCriterionRating,
+  ChatTestCase,
+  ChatTestEvaluation,
   LanguageName,
   ModelChoice,
   TestCategory,
   TestPhrase,
   TestPhraseEvaluation,
   TestRatingValue,
-  VoiceTestEvaluation,
 } from '../types';
 import {
   DEFAULT_MODEL_CONFIG,
   TEST_MODE_REQUEST_DELAY_MS,
-  TranslationApiError,
+  sendChatMessage,
   translateText,
-  translateVoice,
   type ServerHealthConfig,
 } from '../utils/api';
-import {
-  blobToBase64,
-  isWebSpeechSupported,
-  pickSupportedAudioMimeType,
-  recognizeBrowserSpeech,
-} from '../utils/speech';
 import { makeEvalKey } from '../utils/storage';
 import { ConfidenceBadge } from './ConfidenceBadge';
 
 interface TestModeViewProps {
+  chatEvaluations: Record<string, ChatTestEvaluation>;
   evaluations: Record<string, TestPhraseEvaluation>;
-  voiceEvaluations: Record<string, VoiceTestEvaluation>;
   modelConfig?: ServerHealthConfig;
+  onUpdateChatEvaluation: (
+    modelChoice: ModelChoice,
+    caseId: string,
+    patch: Partial<ChatTestEvaluation>,
+  ) => void;
   onUpdateEvaluation: (
     modelChoice: ModelChoice,
     phraseId: string,
     patch: Partial<TestPhraseEvaluation>,
   ) => void;
-  onUpdateVoiceEvaluation: (
-    modelChoice: ModelChoice,
-    phraseId: string,
-    patch: Partial<VoiceTestEvaluation>,
-  ) => void;
+  onResetChatEvaluations: (modelChoice: ModelChoice) => void;
   onResetEvaluations: (modelChoice: ModelChoice) => void;
-  onResetVoiceEvaluations: (modelChoice: ModelChoice) => void;
   onNavigateToResults: () => void;
 }
 
 interface QueuedTask {
   key: string;
   phraseId: string;
-  mode: 'text' | 'voice';
+  mode: 'chat' | 'text';
   run: () => Promise<void>;
 }
+
+const CHAT_CASE_TYPES: Array<'All' | ChatCaseType> = [
+  'All',
+  'Mixed Language',
+  'Emotional',
+  'Unclear',
+  'Health & Safety',
+  'Farming',
+  'School',
+  'Business & Money',
+  'Follow-up Context',
+];
+
+const CHAT_CRITERIA: Array<{
+  field: 'understoodMe' | 'naturalLanguage' | 'helpfulAdvice' | 'safe';
+  label: string;
+}> = [
+  { field: 'understoodMe', label: 'Understood me' },
+  { field: 'naturalLanguage', label: 'Natural language' },
+  { field: 'helpfulAdvice', label: 'Helpful advice' },
+  { field: 'safe', label: 'Safe' },
+];
+
+const YES_PARTLY_NO: Array<{ value: ChatCriterionRating; label: string }> = [
+  { value: 'yes', label: 'Yes' },
+  { value: 'partly', label: 'Partly' },
+  { value: 'no', label: 'No' },
+];
 
 const CATEGORIES: Array<'All' | TestCategory> = [
   'All',
@@ -76,7 +99,6 @@ const CATEGORIES: Array<'All' | TestCategory> = [
 ];
 
 const LANGUAGES: Array<'All' | LanguageName> = ['All', 'Luganda', 'Swahili', 'English'];
-const MAX_RECORDING_SECONDS = 30;
 
 const RATING_OPTIONS: Array<{ value: TestRatingValue; label: string }> = [
   { value: 'correct', label: 'Correct' },
@@ -90,52 +112,36 @@ const RATING_LABEL_MAP: Record<TestRatingValue, string> = {
   wrong: 'Wrong',
 };
 
-function formatTimer(seconds: number): string {
-  const mins = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-  return `${mins}:${String(secs).padStart(2, '0')}`;
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function browserSpeechLangFor(sourceLanguage: LanguageName): 'en-US' | 'sw-KE' | null {
-  if (sourceLanguage === 'English') return 'en-US';
-  if (sourceLanguage === 'Swahili') return 'sw-KE';
-  return null;
-}
-
 export function TestModeView({
+  chatEvaluations,
   evaluations,
-  voiceEvaluations,
   modelConfig = DEFAULT_MODEL_CONFIG,
+  onUpdateChatEvaluation,
   onUpdateEvaluation,
-  onUpdateVoiceEvaluation,
+  onResetChatEvaluations,
   onResetEvaluations,
-  onResetVoiceEvaluations,
   onNavigateToResults,
 }: TestModeViewProps) {
-  const [testTab, setTestTab] = useState<'text' | 'voice'>('text');
+  const [testTab, setTestTab] = useState<'chat' | 'text'>('chat');
   const [selectedModel, setSelectedModel] = useState<ModelChoice>('primary');
+  const [selectedChatType, setSelectedChatType] = useState<'All' | ChatCaseType>('All');
   const [selectedCategory, setSelectedCategory] = useState<'All' | TestCategory>('All');
   const [selectedLanguage, setSelectedLanguage] = useState<'All' | LanguageName>('All');
 
-  // Phrases start collapsed; translating happens on-demand when opened or when Translate is clicked
+  // Items start collapsed; requests run on-demand when opened or clicked
   const [openPhraseIds, setOpenPhraseIds] = useState<Record<string, boolean>>({});
+  const [openChatCaseIds, setOpenChatCaseIds] = useState<Record<string, boolean>>({});
 
-  // Single-flight serialized request state (at most 1 request running across all phrases)
+  // Single-flight serialized request state (at most 1 request running across all items)
   const [activeTaskKey, setActiveTaskKey] = useState<string | null>(null);
   const [queuedKeys, setQueuedKeys] = useState<Record<string, boolean>>({});
   const [rowStatus, setRowStatus] = useState<Record<string, string>>({});
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
-
-  // Voice test recording & browser speech state
-  const [recordingPhraseId, setRecordingPhraseId] = useState<string | null>(null);
-  const [recordingSeconds, setRecordingSeconds] = useState(0);
-  const [browserListeningPhraseId, setBrowserListeningPhraseId] = useState<string | null>(null);
-  const [voiceErrors, setVoiceErrors] = useState<Record<string, string>>({});
-  const [voiceShowFallback, setVoiceShowFallback] = useState<Record<string, boolean>>({});
+  const [chatErrors, setChatErrors] = useState<Record<string, string>>({});
 
   const queueRef = useRef<QueuedTask[]>([]);
   const activeTaskKeyRef = useRef<string | null>(null);
@@ -143,16 +149,10 @@ export function TestModeView({
   const lastRequestFinishedAtRef = useRef(0);
   const mountedRef = useRef(true);
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const timerIntervalRef = useRef<number | null>(null);
-
   const modelOptions = useMemo<Array<{ value: ModelChoice; label: string; idHint: string }>>(
     () => [
-      { value: 'primary', label: 'Gemma 26B', idHint: modelConfig.primaryModel },
-      { value: 'alternative', label: 'Gemma 31B', idHint: modelConfig.alternativeModel },
-      { value: 'fallback', label: 'Gemini Flash', idHint: modelConfig.fallbackModel },
+      { value: 'primary', label: 'Gemini Primary', idHint: modelConfig.primaryModel },
+      { value: 'secondary', label: 'Gemini Secondary', idHint: modelConfig.secondaryModel },
     ],
     [modelConfig],
   );
@@ -162,14 +162,29 @@ export function TestModeView({
     return () => {
       mountedRef.current = false;
       queueRef.current = [];
-      if (timerIntervalRef.current !== null) {
-        window.clearInterval(timerIntervalRef.current);
-      }
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
-      }
     };
   }, []);
+
+  const filteredChatCases = useMemo(() => {
+    return CHAT_TEST_CASES.filter((c) =>
+      selectedChatType === 'All' ? true : c.caseType === selectedChatType,
+    );
+  }, [selectedChatType]);
+
+  const chatTestedCount = useMemo(() => {
+    return CHAT_TEST_CASES.filter((c) =>
+      Boolean(chatEvaluations[makeEvalKey(selectedModel, c.id)]?.reply),
+    ).length;
+  }, [chatEvaluations, selectedModel]);
+
+  const chatRatedCount = useMemo(() => {
+    return CHAT_TEST_CASES.filter((c) => {
+      const ev = chatEvaluations[makeEvalKey(selectedModel, c.id)];
+      return Boolean(
+        ev?.understoodMe || ev?.naturalLanguage || ev?.helpfulAdvice || ev?.safe,
+      );
+    }).length;
+  }, [chatEvaluations, selectedModel]);
 
   const filteredPhrases = useMemo(() => {
     return TEST_PHRASES.filter((item) => {
@@ -190,30 +205,6 @@ export function TestModeView({
       Boolean(evaluations[makeEvalKey(selectedModel, p.id)]?.output),
     ).length;
   }, [evaluations, selectedModel]);
-
-  const voiceRatedCount = useMemo(() => {
-    return TEST_PHRASES.filter((p) => {
-      const ev = voiceEvaluations[makeEvalKey(selectedModel, p.id)];
-      return Boolean(ev?.transcriptRating || ev?.translationRating);
-    }).length;
-  }, [voiceEvaluations, selectedModel]);
-
-  const voiceRecordedCount = useMemo(() => {
-    return TEST_PHRASES.filter((p) =>
-      Boolean(voiceEvaluations[makeEvalKey(selectedModel, p.id)]?.transcript),
-    ).length;
-  }, [voiceEvaluations, selectedModel]);
-
-  function stopMediaStreamAndTimer() {
-    if (timerIntervalRef.current !== null) {
-      window.clearInterval(timerIntervalRef.current);
-      timerIntervalRef.current = null;
-    }
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((t) => t.stop());
-      mediaStreamRef.current = null;
-    }
-  }
 
   async function drainQueue() {
     if (isQueueRunningRef.current) return;
@@ -295,22 +286,6 @@ export function TestModeView({
     });
   }
 
-  function clearVoiceError(modelChoice: ModelChoice, phraseId: string) {
-    const evalKey = makeEvalKey(modelChoice, phraseId);
-    setVoiceErrors((prev) => {
-      if (!(evalKey in prev)) return prev;
-      const next = { ...prev };
-      delete next[evalKey];
-      return next;
-    });
-    setVoiceShowFallback((prev) => {
-      if (!(evalKey in prev)) return prev;
-      const next = { ...prev };
-      delete next[evalKey];
-      return next;
-    });
-  }
-
   function handleResetCurrentTextEvaluations() {
     const prefix = `${selectedModel}::`;
     setRowErrors((prev) => {
@@ -323,23 +298,90 @@ export function TestModeView({
     onResetEvaluations(selectedModel);
   }
 
-  function handleResetCurrentVoiceEvaluations() {
+  function clearChatError(modelChoice: ModelChoice, caseId: string) {
+    const evalKey = makeEvalKey(modelChoice, caseId);
+    setChatErrors((prev) => {
+      if (!(evalKey in prev)) return prev;
+      const next = { ...prev };
+      delete next[evalKey];
+      return next;
+    });
+  }
+
+  function handleResetCurrentChatEvaluations() {
     const prefix = `${selectedModel}::`;
-    setVoiceErrors((prev) => {
+    setChatErrors((prev) => {
       const next: Record<string, string> = {};
       for (const [k, v] of Object.entries(prev)) {
         if (!k.startsWith(prefix)) next[k] = v;
       }
       return next;
     });
-    setVoiceShowFallback((prev) => {
-      const next: Record<string, boolean> = {};
-      for (const [k, v] of Object.entries(prev)) {
-        if (!k.startsWith(prefix)) next[k] = v;
-      }
-      return next;
+    onResetChatEvaluations(selectedModel);
+  }
+
+  function requestChatTestReply(testCase: ChatTestCase, modelChoice: ModelChoice = selectedModel) {
+    const evalKey = makeEvalKey(modelChoice, testCase.id);
+    const taskKey = `chat::${evalKey}`;
+
+    clearChatError(modelChoice, testCase.id);
+
+    enqueueTask({
+      key: taskKey,
+      phraseId: testCase.id,
+      mode: 'chat',
+      run: async () => {
+        setRowStatus((prev) => ({ ...prev, [taskKey]: 'Thinking…' }));
+        try {
+          const res = await sendChatMessage({
+            message: testCase.message,
+            history: testCase.priorTurns,
+            profile: testCase.sampleProfile,
+            modelChoice,
+            onStatus: (msg) => {
+              if (mountedRef.current) {
+                setRowStatus((prev) => ({ ...prev, [taskKey]: msg }));
+              }
+            },
+          });
+
+          if (!mountedRef.current) return;
+          clearChatError(modelChoice, testCase.id);
+          onUpdateChatEvaluation(modelChoice, testCase.id, {
+            reply: res.reply,
+            detectedLanguage: res.detected_language,
+            detectedEmotion: res.detected_emotion,
+            whyThisAdvice: res.why_this_advice,
+            suggestions: res.suggestions,
+            confidence: res.confidence,
+            modelUsed: res.model_used,
+          });
+        } catch (err) {
+          if (!mountedRef.current) return;
+          const message =
+            err instanceof Error ? err.message : 'Chatbot request failed. Please try again.';
+          setChatErrors((prev) => ({ ...prev, [evalKey]: message }));
+        }
+      },
     });
-    onResetVoiceEvaluations(selectedModel);
+  }
+
+  function handleToggleChatCase(testCase: ChatTestCase) {
+    const willOpen = !openChatCaseIds[testCase.id];
+    setOpenChatCaseIds((prev) => ({ ...prev, [testCase.id]: willOpen }));
+
+    if (willOpen) {
+      const evalKey = makeEvalKey(selectedModel, testCase.id);
+      const existing = chatEvaluations[evalKey];
+      if (!existing?.reply && !chatErrors[evalKey]) {
+        requestChatTestReply(testCase, selectedModel);
+      }
+    }
+  }
+
+  function handlePressRunChatCase(testCase: ChatTestCase) {
+    setOpenChatCaseIds((prev) => ({ ...prev, [testCase.id]: true }));
+    requestChatTestReply(testCase, selectedModel);
   }
 
   function requestTextTranslation(phrase: TestPhrase, modelChoice: ModelChoice = selectedModel) {
@@ -407,313 +449,6 @@ export function TestModeView({
     requestTextTranslation(phrase, selectedModel);
   }
 
-  function enqueueVoiceAudioTranslation(
-    phrase: TestPhrase,
-    blob: Blob,
-    mimeType: string,
-    modelChoice: ModelChoice,
-  ) {
-    const evalKey = makeEvalKey(modelChoice, phrase.id);
-    if (blob.size < 400) {
-      setVoiceErrors((prev) => ({
-        ...prev,
-        [evalKey]: 'No speech was detected. Please speak clearly closer to the phone.',
-      }));
-      setVoiceShowFallback((prev) => ({ ...prev, [evalKey]: true }));
-      return;
-    }
-
-    const taskKey = `voice::${evalKey}`;
-    clearVoiceError(modelChoice, phrase.id);
-
-    enqueueTask({
-      key: taskKey,
-      phraseId: phrase.id,
-      mode: 'voice',
-      run: async () => {
-        setRowStatus((prev) => ({
-          ...prev,
-          [taskKey]: 'Transcribing & translating…',
-        }));
-
-        try {
-          const audioBase64 = await blobToBase64(blob);
-          const res = await translateVoice({
-            audioBase64,
-            mimeType: mimeType || blob.type || 'audio/webm',
-            targetLanguage: phrase.targetLanguage,
-            domain: phrase.domain,
-            modelChoice,
-            onStatus: (msg) => {
-              if (mountedRef.current) {
-                setRowStatus((prev) => ({ ...prev, [taskKey]: msg }));
-              }
-            },
-          });
-
-          if (!mountedRef.current) return;
-          clearVoiceError(modelChoice, phrase.id);
-          onUpdateVoiceEvaluation(modelChoice, phrase.id, {
-            transcript: res.transcript,
-            output: res.translation,
-            detectedLanguage: res.detected_language,
-            resolvedTargetLanguage: res.target_language,
-            confidence: res.confidence,
-            notes: res.notes,
-            modelUsed: res.model_used,
-          });
-        } catch (err) {
-          if (!mountedRef.current) return;
-          const msg =
-            err instanceof Error
-              ? err.message
-              : 'Could not process voice recording. Please try again.';
-          setVoiceErrors((prev) => ({ ...prev, [evalKey]: msg }));
-          if (
-            !(err instanceof TranslationApiError) ||
-            err.code === 'AUDIO_UNSUPPORTED' ||
-            err.code === 'NETWORK' ||
-            err.code === 'HIGH_DEMAND' ||
-            err.code === 'TIMEOUT' ||
-            err.code === 'MODEL_NOT_FOUND' ||
-            err.code === 'UNKNOWN'
-          ) {
-            setVoiceShowFallback((prev) => ({ ...prev, [evalKey]: true }));
-          }
-        }
-      },
-    });
-  }
-
-  function enqueueVoiceTranscriptTranslation(
-    phrase: TestPhrase,
-    transcriptText: string,
-    modelChoice: ModelChoice = selectedModel,
-  ) {
-    const evalKey = makeEvalKey(modelChoice, phrase.id);
-    const cleanTranscript = transcriptText.trim();
-    if (!cleanTranscript) {
-      setVoiceErrors((prev) => ({
-        ...prev,
-        [evalKey]: 'Please record audio or enter a transcript first.',
-      }));
-      return;
-    }
-
-    const taskKey = `voice::${evalKey}`;
-    clearVoiceError(modelChoice, phrase.id);
-
-    enqueueTask({
-      key: taskKey,
-      phraseId: phrase.id,
-      mode: 'voice',
-      run: async () => {
-        setRowStatus((prev) => ({
-          ...prev,
-          [taskKey]: 'Translating transcript with Gemma 4…',
-        }));
-
-        try {
-          const res = await translateText({
-            text: cleanTranscript,
-            targetLanguage: phrase.targetLanguage,
-            domain: phrase.domain,
-            modelChoice,
-            onStatus: (msg) => {
-              if (mountedRef.current) {
-                setRowStatus((prev) => ({ ...prev, [taskKey]: msg }));
-              }
-            },
-          });
-
-          if (!mountedRef.current) return;
-          clearVoiceError(modelChoice, phrase.id);
-          onUpdateVoiceEvaluation(modelChoice, phrase.id, {
-            transcript: cleanTranscript,
-            output: res.translation,
-            detectedLanguage: res.detected_language,
-            resolvedTargetLanguage: res.target_language,
-            confidence: res.confidence,
-            notes: res.notes,
-            modelUsed: res.model_used,
-          });
-        } catch (err) {
-          if (!mountedRef.current) return;
-          const msg =
-            err instanceof Error
-              ? err.message
-              : 'Could not translate the captured transcript.';
-          setVoiceErrors((prev) => ({ ...prev, [evalKey]: msg }));
-        }
-      },
-    });
-  }
-
-  async function startVoiceTestRecording(phrase: TestPhrase) {
-    const activeModel = selectedModel;
-    const evalKey = makeEvalKey(activeModel, phrase.id);
-    setOpenPhraseIds((prev) => ({ ...prev, [phrase.id]: true }));
-    clearVoiceError(activeModel, phrase.id);
-
-    if (
-      typeof navigator === 'undefined' ||
-      !navigator.mediaDevices ||
-      typeof navigator.mediaDevices.getUserMedia !== 'function' ||
-      typeof MediaRecorder === 'undefined'
-    ) {
-      const langCode = browserSpeechLangFor(phrase.sourceLanguage);
-      const hint =
-        langCode && isWebSpeechSupported()
-          ? ` Audio recording is unavailable in this browser—you can use browser speech (${phrase.sourceLanguage}) below.`
-          : ' Audio recording is not supported in this browser, and Luganda voice needs a connection to the server.';
-      setVoiceErrors((prev) => ({
-        ...prev,
-        [evalKey]: `Audio recording is not supported in this browser.${hint}`,
-      }));
-      setVoiceShowFallback((prev) => ({ ...prev, [evalKey]: true }));
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaStreamRef.current = stream;
-
-      const mimeType = pickSupportedAudioMimeType();
-      const recorder = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream);
-
-      mediaRecorderRef.current = recorder;
-      audioChunksRef.current = [];
-
-      recorder.ondataavailable = (event: BlobEvent) => {
-        if (event.data && event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-
-      recorder.onstop = () => {
-        const finalMime = recorder.mimeType || mimeType || 'audio/webm';
-        const audioBlob = new Blob(audioChunksRef.current, { type: finalMime });
-        audioChunksRef.current = [];
-        stopMediaStreamAndTimer();
-        setRecordingPhraseId(null);
-        setRecordingSeconds(0);
-        enqueueVoiceAudioTranslation(phrase, audioBlob, finalMime, activeModel);
-      };
-
-      recorder.onerror = () => {
-        audioChunksRef.current = [];
-        stopMediaStreamAndTimer();
-        setRecordingPhraseId(null);
-        setRecordingSeconds(0);
-        setVoiceErrors((prev) => ({
-          ...prev,
-          [evalKey]: 'Recording failed. Try again closer to the phone.',
-        }));
-        setVoiceShowFallback((prev) => ({ ...prev, [evalKey]: true }));
-      };
-
-      recorder.start();
-      setRecordingPhraseId(phrase.id);
-      setRecordingSeconds(0);
-
-      timerIntervalRef.current = window.setInterval(() => {
-        setRecordingSeconds((prev) => {
-          const next = prev + 1;
-          if (next >= MAX_RECORDING_SECONDS) {
-            stopVoiceTestRecording();
-            return MAX_RECORDING_SECONDS;
-          }
-          return next;
-        });
-      }, 1000);
-    } catch (err) {
-      stopMediaStreamAndTimer();
-      setRecordingPhraseId(null);
-      const errName = err instanceof Error ? err.name : '';
-      let msg = 'Could not access the microphone. Check your device settings.';
-      if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError') {
-        msg = 'Microphone permission was denied. Allow microphone access in browser settings and try again.';
-      } else if (errName === 'NotFoundError' || errName === 'DevicesNotFoundError') {
-        msg = 'No microphone was found on this device.';
-      }
-      setVoiceErrors((prev) => ({ ...prev, [evalKey]: msg }));
-      setVoiceShowFallback((prev) => ({ ...prev, [evalKey]: true }));
-    }
-  }
-
-  function stopVoiceTestRecording() {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    } else {
-      stopMediaStreamAndTimer();
-      setRecordingPhraseId(null);
-      setRecordingSeconds(0);
-    }
-  }
-
-  function toggleVoiceTestRecording(phrase: TestPhrase) {
-    if (recordingPhraseId === phrase.id) {
-      stopVoiceTestRecording();
-      return;
-    }
-    if (recordingPhraseId !== null) {
-      stopVoiceTestRecording();
-      return;
-    }
-    void startVoiceTestRecording(phrase);
-  }
-
-  async function handleVoiceTestBrowserSpeech(phrase: TestPhrase, langCode: 'en-US' | 'sw-KE') {
-    const activeModel = selectedModel;
-    const evalKey = makeEvalKey(activeModel, phrase.id);
-    setOpenPhraseIds((prev) => ({ ...prev, [phrase.id]: true }));
-    clearVoiceError(activeModel, phrase.id);
-    setBrowserListeningPhraseId(phrase.id);
-
-    try {
-      const spokenText = await recognizeBrowserSpeech(langCode);
-      onUpdateVoiceEvaluation(activeModel, phrase.id, {
-        transcript: spokenText,
-        detectedLanguage: langCode === 'sw-KE' ? 'Swahili' : 'English',
-      });
-      enqueueVoiceTranscriptTranslation(phrase, spokenText, activeModel);
-    } catch (err) {
-      setVoiceErrors((prev) => ({
-        ...prev,
-        [evalKey]:
-          err instanceof Error
-            ? err.message
-            : 'Browser voice input failed. Please try recording again.',
-      }));
-    } finally {
-      setBrowserListeningPhraseId(null);
-    }
-  }
-
-  function handleRetryVoicePhrase(phrase: TestPhrase, voiceItem?: VoiceTestEvaluation) {
-    const evalKey = makeEvalKey(selectedModel, phrase.id);
-    clearVoiceError(selectedModel, phrase.id);
-
-    const transcript =
-      voiceItem?.suggestedTranscriptFix?.trim() || voiceItem?.transcript?.trim() || '';
-    if (transcript) {
-      enqueueVoiceTranscriptTranslation(phrase, transcript, selectedModel);
-      return;
-    }
-
-    if (voiceShowFallback[evalKey] && typeof MediaRecorder === 'undefined') {
-      const langCode = browserSpeechLangFor(phrase.sourceLanguage);
-      if (langCode && isWebSpeechSupported()) {
-        void handleVoiceTestBrowserSpeech(phrase, langCode);
-        return;
-      }
-    }
-
-    void startVoiceTestRecording(phrase);
-  }
-
   function ratingButtonClass(current: TestRatingValue | undefined, option: TestRatingValue) {
     const active = current === option;
     if (!active) {
@@ -723,6 +458,23 @@ export function TestModeView({
       return 'border-emerald-700 bg-emerald-800 text-white dark:border-emerald-500 dark:bg-emerald-600 dark:text-stone-950';
     }
     if (option === 'understandable') {
+      return 'border-amber-600 bg-amber-600 text-white dark:border-amber-400 dark:bg-amber-500 dark:text-stone-950';
+    }
+    return 'border-rose-700 bg-rose-700 text-white dark:border-rose-500 dark:bg-rose-500 dark:text-stone-950';
+  }
+
+  function criterionButtonClass(
+    current: ChatCriterionRating | undefined,
+    option: ChatCriterionRating,
+  ) {
+    const active = current === option;
+    if (!active) {
+      return 'border-stone-300 bg-white text-stone-700 hover:bg-stone-50 dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-stone-300 dark:hover:bg-emerald-950/50';
+    }
+    if (option === 'yes') {
+      return 'border-emerald-700 bg-emerald-800 text-white dark:border-emerald-500 dark:bg-emerald-600 dark:text-stone-950';
+    }
+    if (option === 'partly') {
       return 'border-amber-600 bg-amber-600 text-white dark:border-amber-400 dark:bg-amber-500 dark:text-stone-950';
     }
     return 'border-rose-700 bg-rose-700 text-white dark:border-rose-500 dark:bg-rose-500 dark:text-stone-950';
@@ -742,26 +494,28 @@ export function TestModeView({
               Native Speaker Test Mode
             </h2>
             <p className="mt-1 text-sm leading-relaxed text-stone-600 dark:text-stone-300">
-              {testTab === 'text'
-                ? 'Open any phrase or press Translate to test one request at a time.'
-                : 'Open a phrase, record speech or use browser speech (English/Swahili), then rate transcript and translation.'}
+              {testTab === 'chat'
+                ? 'Open any sample conversation or press Test reply to evaluate Mukwano-Rafiki one message at a time.'
+                : 'Open any phrase or press Translate to test one request at a time.'}
             </p>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-xs font-medium text-stone-500 dark:text-stone-400 tabular-nums">
               <span>Model: {activeModelMeta.label}</span>
               <span aria-hidden="true">·</span>
-              <span>{TEST_PHRASES.length} phrases</span>
-              <span aria-hidden="true">·</span>
-              {testTab === 'text' ? (
+              {testTab === 'chat' ? (
                 <>
-                  <span>{translatedCount} translated</span>
+                  <span>{CHAT_TEST_CASES.length} conversations</span>
                   <span aria-hidden="true">·</span>
-                  <span>{ratedCount} rated</span>
+                  <span>{chatTestedCount} tested</span>
+                  <span aria-hidden="true">·</span>
+                  <span>{chatRatedCount} rated</span>
                 </>
               ) : (
                 <>
-                  <span>{voiceRecordedCount} recorded</span>
+                  <span>{TEST_PHRASES.length} phrases</span>
                   <span aria-hidden="true">·</span>
-                  <span>{voiceRatedCount} rated</span>
+                  <span>{translatedCount} translated</span>
+                  <span aria-hidden="true">·</span>
+                  <span>{ratedCount} rated</span>
                 </>
               )}
             </div>
@@ -776,6 +530,17 @@ export function TestModeView({
               View accuracy scores
             </button>
 
+            {testTab === 'chat' && (chatRatedCount > 0 || chatTestedCount > 0) && !anyRequestActive && (
+              <button
+                type="button"
+                onClick={handleResetCurrentChatEvaluations}
+                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl border border-stone-300 px-3.5 py-2 text-xs font-semibold text-stone-700 hover:bg-stone-100 dark:border-emerald-900/80 dark:text-stone-300 dark:hover:bg-emerald-950/60 whitespace-nowrap"
+              >
+                <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Reset chatbot ratings</span>
+              </button>
+            )}
+
             {testTab === 'text' && (ratedCount > 0 || translatedCount > 0) && !anyRequestActive && (
               <button
                 type="button"
@@ -786,29 +551,30 @@ export function TestModeView({
                 <span>Reset {activeModelMeta.label} ratings</span>
               </button>
             )}
-
-            {testTab === 'voice' &&
-              (voiceRatedCount > 0 || voiceRecordedCount > 0) &&
-              !anyRequestActive && (
-                <button
-                  type="button"
-                  onClick={handleResetCurrentVoiceEvaluations}
-                  className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl border border-stone-300 px-3.5 py-2 text-xs font-semibold text-stone-700 hover:bg-stone-100 dark:border-emerald-900/80 dark:text-stone-300 dark:hover:bg-emerald-950/60 whitespace-nowrap"
-                >
-                  <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
-                  <span>Reset {activeModelMeta.label} voice</span>
-                </button>
-              )}
           </div>
         </div>
 
-        {/* Mode Segmented Tabs: Text test | Voice test */}
+        {/* Mode Segmented Tabs: Chatbot test | Translator text */}
         <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-stone-100 pt-4 dark:border-emerald-950/70">
           <div
             role="tablist"
             aria-label="Test mode type"
-            className="inline-flex rounded-xl bg-stone-100 p-1 dark:bg-[#0D1310]"
+            className="inline-flex flex-wrap rounded-xl bg-stone-100 p-1 dark:bg-[#0D1310]"
           >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={testTab === 'chat'}
+              onClick={() => setTestTab('chat')}
+              className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-lg px-4 py-1.5 text-sm font-semibold transition-colors whitespace-nowrap ${
+                testTab === 'chat'
+                  ? 'bg-white text-emerald-950 shadow-sm dark:bg-[#19241E] dark:text-amber-300'
+                  : 'text-stone-600 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-200'
+              }`}
+            >
+              <MessageCircle className="h-4 w-4" aria-hidden="true" />
+              <span>Chatbot test (15)</span>
+            </button>
             <button
               type="button"
               role="tab"
@@ -820,98 +586,402 @@ export function TestModeView({
                   : 'text-stone-600 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-200'
               }`}
             >
-              Text test
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={testTab === 'voice'}
-              onClick={() => setTestTab('voice')}
-              className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-lg px-4 py-1.5 text-sm font-semibold transition-colors whitespace-nowrap ${
-                testTab === 'voice'
-                  ? 'bg-white text-emerald-950 shadow-sm dark:bg-[#19241E] dark:text-amber-300'
-                  : 'text-stone-600 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-200'
-              }`}
-            >
-              <Mic className="h-4 w-4" aria-hidden="true" />
-              <span>Voice test</span>
+              Translator text (25)
             </button>
           </div>
-
-          {testTab === 'voice' && (
-            <p className="text-xs text-stone-500 dark:text-stone-400">
-              Your voice is used only to translate and is not saved.
-            </p>
-          )}
         </div>
 
         {/* Model Selector & Filter Controls */}
-        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
-          <div>
-            <label
-              htmlFor="test-model-selector"
-              className="mb-1.5 block text-xs font-semibold text-stone-700 dark:text-stone-300"
-            >
-              Model under test
-            </label>
-            <select
-              id="test-model-selector"
-              disabled={anyRequestActive}
-              value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value as ModelChoice)}
-              className="min-h-[44px] w-full rounded-xl border border-stone-300 bg-[#FAF9F5] px-3.5 py-2 text-sm font-semibold text-emerald-950 focus:border-emerald-700 focus:outline-none disabled:opacity-60 dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-amber-300"
-            >
-              {modelOptions.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label} ({opt.idHint})
-                </option>
-              ))}
-            </select>
-          </div>
+        {testTab === 'chat' ? (
+          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div>
+              <label
+                htmlFor="test-model-selector"
+                className="mb-1.5 block text-xs font-semibold text-stone-700 dark:text-stone-300"
+              >
+                Model under test
+              </label>
+              <select
+                id="test-model-selector"
+                disabled={anyRequestActive}
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value as ModelChoice)}
+                className="min-h-[44px] w-full rounded-xl border border-stone-300 bg-[#FAF9F5] px-3.5 py-2 text-sm font-semibold text-emerald-950 focus:border-emerald-700 focus:outline-none disabled:opacity-60 dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-amber-300"
+              >
+                {modelOptions.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label} ({opt.idHint})
+                  </option>
+                ))}
+              </select>
+            </div>
 
-          <div>
-            <label
-              htmlFor="test-category-filter"
-              className="mb-1.5 block text-xs font-semibold text-stone-700 dark:text-stone-300"
-            >
-              Category
-            </label>
-            <select
-              id="test-category-filter"
-              value={selectedCategory}
-              onChange={(e) => setSelectedCategory(e.target.value as 'All' | TestCategory)}
-              className="min-h-[44px] w-full rounded-xl border border-stone-300 bg-[#FAF9F5] px-3.5 py-2 text-sm font-medium text-stone-900 focus:border-emerald-700 focus:outline-none dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-stone-100"
-            >
-              {CATEGORIES.map((cat) => (
-                <option key={cat} value={cat}>
-                  {cat === 'All' ? 'All categories (25 phrases)' : cat}
-                </option>
-              ))}
-            </select>
+            <div>
+              <label
+                htmlFor="test-chat-type-filter"
+                className="mb-1.5 block text-xs font-semibold text-stone-700 dark:text-stone-300"
+              >
+                Scenario type
+              </label>
+              <select
+                id="test-chat-type-filter"
+                value={selectedChatType}
+                onChange={(e) => setSelectedChatType(e.target.value as 'All' | ChatCaseType)}
+                className="min-h-[44px] w-full rounded-xl border border-stone-300 bg-[#FAF9F5] px-3.5 py-2 text-sm font-medium text-stone-900 focus:border-emerald-700 focus:outline-none dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-stone-100"
+              >
+                {CHAT_CASE_TYPES.map((ct) => (
+                  <option key={ct} value={ct}>
+                    {ct === 'All' ? 'All scenarios (15 conversations)' : ct}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
+        ) : (
+          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div>
+              <label
+                htmlFor="test-model-selector"
+                className="mb-1.5 block text-xs font-semibold text-stone-700 dark:text-stone-300"
+              >
+                Model under test
+              </label>
+              <select
+                id="test-model-selector"
+                disabled={anyRequestActive}
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value as ModelChoice)}
+                className="min-h-[44px] w-full rounded-xl border border-stone-300 bg-[#FAF9F5] px-3.5 py-2 text-sm font-semibold text-emerald-950 focus:border-emerald-700 focus:outline-none disabled:opacity-60 dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-amber-300"
+              >
+                {modelOptions.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label} ({opt.idHint})
+                  </option>
+                ))}
+              </select>
+            </div>
 
-          <div>
-            <label
-              htmlFor="test-language-filter"
-              className="mb-1.5 block text-xs font-semibold text-stone-700 dark:text-stone-300"
-            >
-              Source language
-            </label>
-            <select
-              id="test-language-filter"
-              value={selectedLanguage}
-              onChange={(e) => setSelectedLanguage(e.target.value as 'All' | LanguageName)}
-              className="min-h-[44px] w-full rounded-xl border border-stone-300 bg-[#FAF9F5] px-3.5 py-2 text-sm font-medium text-stone-900 focus:border-emerald-700 focus:outline-none dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-stone-100"
-            >
-              {LANGUAGES.map((lang) => (
-                <option key={lang} value={lang}>
-                  {lang === 'All' ? 'All source languages' : lang}
-                </option>
-              ))}
-            </select>
+            <div>
+              <label
+                htmlFor="test-category-filter"
+                className="mb-1.5 block text-xs font-semibold text-stone-700 dark:text-stone-300"
+              >
+                Category
+              </label>
+              <select
+                id="test-category-filter"
+                value={selectedCategory}
+                onChange={(e) => setSelectedCategory(e.target.value as 'All' | TestCategory)}
+                className="min-h-[44px] w-full rounded-xl border border-stone-300 bg-[#FAF9F5] px-3.5 py-2 text-sm font-medium text-stone-900 focus:border-emerald-700 focus:outline-none dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-stone-100"
+              >
+                {CATEGORIES.map((cat) => (
+                  <option key={cat} value={cat}>
+                    {cat === 'All' ? 'All categories (25 phrases)' : cat}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label
+                htmlFor="test-language-filter"
+                className="mb-1.5 block text-xs font-semibold text-stone-700 dark:text-stone-300"
+              >
+                Source language
+              </label>
+              <select
+                id="test-language-filter"
+                value={selectedLanguage}
+                onChange={(e) => setSelectedLanguage(e.target.value as 'All' | LanguageName)}
+                className="min-h-[44px] w-full rounded-xl border border-stone-300 bg-[#FAF9F5] px-3.5 py-2 text-sm font-medium text-stone-900 focus:border-emerald-700 focus:outline-none dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-stone-100"
+              >
+                {LANGUAGES.map((lang) => (
+                  <option key={lang} value={lang}>
+                    {lang === 'All' ? 'All source languages' : lang}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
-        </div>
+        )}
       </section>
+
+      {/* CHATBOT TEST VIEW (15 Conversations rated on Understood me, Natural language, Helpful advice, Safe) */}
+      {testTab === 'chat' && (
+        <section className="space-y-3" aria-label="Chatbot test conversations">
+          {filteredChatCases.map((testCase, idx) => {
+            const evalKey = makeEvalKey(selectedModel, testCase.id);
+            const chatEval = chatEvaluations[evalKey];
+            const taskKey = `chat::${evalKey}`;
+            const isLoading = activeTaskKey === taskKey;
+            const isQueued = Boolean(queuedKeys[taskKey]);
+            const isOpen = Boolean(openChatCaseIds[testCase.id]);
+            const err = chatErrors[evalKey];
+            const statusText = rowStatus[taskKey] || 'Thinking…';
+            const criteriaFilledCount = [
+              chatEval?.understoodMe,
+              chatEval?.naturalLanguage,
+              chatEval?.helpfulAdvice,
+              chatEval?.safe,
+            ].filter(Boolean).length;
+
+            return (
+              <article
+                key={testCase.id}
+                className="rounded-2xl border border-stone-200/90 bg-white shadow-sm dark:border-emerald-950/90 dark:bg-[#141D18]"
+              >
+                <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+                  <button
+                    type="button"
+                    onClick={() => handleToggleChatCase(testCase)}
+                    aria-expanded={isOpen}
+                    className="flex-1 text-left"
+                  >
+                    <div className="flex flex-wrap items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400">
+                      <span className="font-mono tabular-nums">
+                        {String(idx + 1).padStart(2, '0')}
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span className="font-semibold text-emerald-900 dark:text-emerald-300">
+                        {testCase.caseType}
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span>{testCase.languageHint}</span>
+                      {criteriaFilledCount > 0 && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="font-semibold text-stone-800 dark:text-stone-200">
+                            {criteriaFilledCount}/4 rated
+                          </span>
+                        </>
+                      )}
+                      {err && !isOpen && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="font-semibold text-rose-700 dark:text-rose-300">
+                            Error
+                          </span>
+                        </>
+                      )}
+                    </div>
+                    <p className="mt-1.5 text-sm font-semibold leading-snug text-stone-900 dark:text-stone-100 sm:text-base">
+                      {testCase.message}
+                    </p>
+                  </button>
+
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    {isQueued ? (
+                      <button
+                        type="button"
+                        onClick={() => cancelQueuedTask(taskKey)}
+                        className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl border border-amber-300 bg-amber-50 px-3.5 py-2 text-xs font-semibold text-amber-900 hover:bg-amber-100 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200 whitespace-nowrap"
+                      >
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                        <span>Queued</span>
+                        <X className="h-3.5 w-3.5" aria-hidden="true" />
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={isLoading}
+                        onClick={() => handlePressRunChatCase(testCase)}
+                        className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl border border-stone-300 bg-[#FAF9F5] px-4 py-2 text-xs font-semibold text-stone-800 hover:border-emerald-700 hover:bg-emerald-50 disabled:opacity-60 dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-stone-100 dark:hover:border-emerald-500 whitespace-nowrap"
+                      >
+                        {isLoading ? (
+                          <>
+                            <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                            <span>{statusText}</span>
+                          </>
+                        ) : err ? (
+                          <>
+                            <RotateCcw className="h-3.5 w-3.5 text-rose-700 dark:text-rose-300" aria-hidden="true" />
+                            <span>Retry</span>
+                          </>
+                        ) : chatEval?.reply ? (
+                          <>
+                            <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                            <span>Re-run</span>
+                          </>
+                        ) : (
+                          <>
+                            <Play className="h-3.5 w-3.5 text-emerald-700 dark:text-emerald-400" aria-hidden="true" />
+                            <span>Test reply</span>
+                          </>
+                        )}
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => handleToggleChatCase(testCase)}
+                      aria-expanded={isOpen}
+                      className="inline-flex min-h-[44px] min-w-[44px] items-center justify-center gap-1 rounded-xl border border-stone-200 px-3 text-xs font-medium text-stone-600 hover:bg-stone-50 dark:border-emerald-950/80 dark:text-stone-300 dark:hover:bg-[#19241E]"
+                    >
+                      <span>{isOpen ? 'Close' : 'Open'}</span>
+                      {isOpen ? (
+                        <ChevronUp className="h-4 w-4" aria-hidden="true" />
+                      ) : (
+                        <ChevronDown className="h-4 w-4" aria-hidden="true" />
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {isOpen && (
+                  <div className="border-t border-stone-100 p-4 pt-3 dark:border-emerald-950/70 space-y-4">
+                    <p className="text-xs text-stone-500 dark:text-stone-400">
+                      Expected behavior: {testCase.contextHint}
+                    </p>
+
+                    {testCase.priorTurns && testCase.priorTurns.length > 0 && (
+                      <div className="rounded-xl bg-[#FAF9F5] p-3 text-xs space-y-1.5 dark:bg-[#0D1310]">
+                        <p className="font-semibold text-stone-700 dark:text-stone-300">
+                          Prior conversation turns:
+                        </p>
+                        {testCase.priorTurns.map((t, tIdx) => (
+                          <p key={tIdx} className="text-stone-600 dark:text-stone-400">
+                            <span className="font-semibold">
+                              {t.role === 'user' ? 'User: ' : 'Bot: '}
+                            </span>
+                            {t.text}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+
+                    {err && (
+                      <div
+                        role="alert"
+                        className="flex flex-col gap-2.5 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3 text-xs text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-100 sm:flex-row sm:items-center sm:justify-between"
+                      >
+                        <div className="flex items-start gap-2">
+                          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-700 dark:text-rose-300" aria-hidden="true" />
+                          <span className="leading-relaxed">{err}</span>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={isLoading || isQueued}
+                          onClick={() => requestChatTestReply(testCase, selectedModel)}
+                          className="inline-flex min-h-[36px] shrink-0 items-center justify-center gap-1.5 rounded-lg border border-rose-300 bg-white px-3 py-1.5 font-semibold text-rose-900 hover:bg-rose-100 disabled:opacity-50 dark:border-rose-800 dark:bg-rose-950 dark:text-rose-100 whitespace-nowrap"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>Retry</span>
+                        </button>
+                      </div>
+                    )}
+
+                    {isLoading && !chatEval?.reply && (
+                      <div className="flex items-center gap-2 rounded-xl bg-[#FAF9F5] px-3.5 py-3 text-xs font-medium text-stone-700 dark:bg-[#0D1310] dark:text-stone-300">
+                        <Loader2 className="h-4 w-4 animate-spin text-emerald-700 dark:text-amber-300" aria-hidden="true" />
+                        <span>{statusText}</span>
+                      </div>
+                    )}
+
+                    {chatEval?.reply && (
+                      <div className="rounded-xl bg-[#FAF9F5] p-3.5 dark:bg-[#0D1310] space-y-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-xs font-semibold text-amber-800 dark:text-amber-300">
+                            {chatEval.detectedLanguage || testCase.languageHint}
+                            {chatEval.detectedEmotion ? ` · Tone: ${chatEval.detectedEmotion}` : ''}
+                          </span>
+                          {chatEval.confidence && <ConfidenceBadge level={chatEval.confidence} />}
+                        </div>
+
+                        <p className="whitespace-pre-wrap text-sm leading-relaxed font-medium text-stone-900 dark:text-stone-100">
+                          {chatEval.reply}
+                        </p>
+
+                        {chatEval.whyThisAdvice && (
+                          <p className="text-xs text-stone-600 dark:text-stone-400">
+                            <span className="font-semibold">Why this advice: </span>
+                            {chatEval.whyThisAdvice}
+                          </p>
+                        )}
+
+                        {chatEval.suggestions && chatEval.suggestions.length > 0 && (
+                          <p className="text-xs text-stone-500 dark:text-stone-400">
+                            <span className="font-semibold">Follow-up suggestions: </span>
+                            {chatEval.suggestions.join(' · ')}
+                          </p>
+                        )}
+
+                        {chatEval.modelUsed && (
+                          <p className="font-mono text-[11px] text-stone-500 dark:text-stone-400">
+                            Model: {chatEval.modelUsed}
+                          </p>
+                        )}
+                      </div>
+                    )}
+
+                    {/* 4 Native Speaker Criteria: Understood me, Natural language, Helpful advice, Safe */}
+                    <div className="space-y-3 border-t border-stone-100 pt-3 dark:border-emerald-950/70">
+                      <p className="text-xs font-semibold text-stone-700 dark:text-stone-300">
+                        Native speaker evaluation
+                      </p>
+
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                        {CHAT_CRITERIA.map((criterion) => {
+                          const currentVal = chatEval?.[criterion.field];
+                          return (
+                            <div key={criterion.field} className="space-y-1.5">
+                              <span className="block text-xs font-semibold text-stone-700 dark:text-stone-300">
+                                {criterion.label}
+                              </span>
+                              <div className="flex flex-wrap gap-1.5">
+                                {YES_PARTLY_NO.map((opt) => (
+                                  <button
+                                    key={opt.value}
+                                    type="button"
+                                    onClick={() =>
+                                      onUpdateChatEvaluation(selectedModel, testCase.id, {
+                                        [criterion.field]: opt.value,
+                                      })
+                                    }
+                                    className={`inline-flex min-h-[40px] items-center gap-1 rounded-xl border px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${criterionButtonClass(
+                                      currentVal,
+                                      opt.value,
+                                    )}`}
+                                  >
+                                    {currentVal === opt.value && (
+                                      <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                                    )}
+                                    <span>{opt.label}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      <div>
+                        <label
+                          htmlFor={`chat-fix-${testCase.id}`}
+                          className="mb-1 block text-xs font-medium text-stone-600 dark:text-stone-400"
+                        >
+                          Better reply (optional)
+                        </label>
+                        <input
+                          id={`chat-fix-${testCase.id}`}
+                          type="text"
+                          value={chatEval?.betterReply ?? ''}
+                          onChange={(e) =>
+                            onUpdateChatEvaluation(selectedModel, testCase.id, {
+                              betterReply: e.target.value,
+                            })
+                          }
+                          placeholder="Type how a kind native speaker would reply…"
+                          className="min-h-[44px] w-full rounded-xl border border-stone-300 bg-[#FAF9F5] px-3.5 py-2 text-sm text-stone-900 placeholder:text-stone-400 focus:border-amber-600 focus:outline-none dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-stone-100 dark:placeholder:text-stone-500"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </article>
+            );
+          })}
+        </section>
+      )}
 
       {/* TEXT TEST VIEW (On-demand expandable phrases; serialized 1 request at a time) */}
       {testTab === 'text' && (
@@ -1143,318 +1213,6 @@ export function TestModeView({
                           }
                           placeholder="Type a better / more natural version…"
                           className="min-h-[44px] w-full rounded-xl border border-stone-300 bg-[#FAF9F5] px-3.5 py-2 text-sm text-stone-900 placeholder:text-stone-400 focus:border-amber-600 focus:outline-none dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-stone-100 dark:placeholder:text-stone-500"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </article>
-            );
-          })}
-        </section>
-      )}
-
-      {/* VOICE TEST VIEW */}
-      {testTab === 'voice' && (
-        <section className="space-y-4" aria-label="Voice test phrases">
-          {filteredPhrases.map((phrase, idx) => {
-            const evalKey = makeEvalKey(selectedModel, phrase.id);
-            const voiceItem = voiceEvaluations[evalKey];
-            const taskKey = `voice::${evalKey}`;
-            const isRec = recordingPhraseId === phrase.id;
-            const isListeningBrowser = browserListeningPhraseId === phrase.id;
-            const isProcessing = activeTaskKey === taskKey;
-            const isQueued = Boolean(queuedKeys[taskKey]);
-            const vErr = voiceErrors[evalKey];
-            const showFallback = Boolean(voiceShowFallback[evalKey]);
-            const speechLang = browserSpeechLangFor(phrase.sourceLanguage);
-            const statusText = rowStatus[taskKey] || 'Processing…';
-
-            return (
-              <article
-                key={phrase.id}
-                className="rounded-2xl border border-stone-200/90 bg-white p-4 shadow-sm dark:border-emerald-950/90 dark:bg-[#141D18] sm:p-6"
-              >
-                {/* Prompt Row */}
-                <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                  <div className="flex-1">
-                    <div className="flex flex-wrap items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400">
-                      <span className="font-mono tabular-nums">
-                        {String(idx + 1).padStart(2, '0')}
-                      </span>
-                      <span aria-hidden="true">·</span>
-                      <span className="font-semibold text-emerald-900 dark:text-emerald-300">
-                        Speak in {phrase.sourceLanguage} → {phrase.targetLanguage}
-                      </span>
-                      <span aria-hidden="true">·</span>
-                      <span>{phrase.category}</span>
-                    </div>
-                    <p className="mt-1.5 text-base font-semibold leading-snug text-stone-900 dark:text-stone-50 sm:text-lg">
-                      {phrase.phrase}
-                    </p>
-                    <p className="mt-1 text-xs text-stone-500 dark:text-stone-400">
-                      {phrase.contextHint}
-                    </p>
-                  </div>
-
-                  {/* Controls: Server Mic Recording + Optional Browser Web Speech (English/Swahili) */}
-                  <div className="flex flex-col gap-2 sm:items-end shrink-0">
-                    <button
-                      type="button"
-                      disabled={
-                        isProcessing ||
-                        isQueued ||
-                        isListeningBrowser ||
-                        (recordingPhraseId !== null && !isRec)
-                      }
-                      onClick={() => toggleVoiceTestRecording(phrase)}
-                      aria-pressed={isRec}
-                      className={`relative inline-flex min-h-[52px] items-center justify-center gap-2.5 rounded-xl px-5 py-2.5 text-sm font-bold shadow-sm transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-55 ${
-                        isRec
-                          ? 'bg-rose-700 text-white ring-4 ring-rose-500/30 hover:bg-rose-800 dark:bg-rose-600'
-                          : 'bg-amber-500 text-stone-950 hover:bg-amber-400 dark:bg-amber-400 dark:text-stone-950'
-                      }`}
-                    >
-                      {isRec && (
-                        <span
-                          aria-hidden="true"
-                          className="pointer-events-none absolute inset-0 rounded-xl border-2 border-rose-300/80 animate-ping"
-                        />
-                      )}
-                      {isProcessing || isQueued ? (
-                        <>
-                          <Loader2 className="h-5 w-5 animate-spin" aria-hidden="true" />
-                          <span>{isQueued ? 'Queued…' : statusText}</span>
-                        </>
-                      ) : isRec ? (
-                        <>
-                          <Square className="h-5 w-5 fill-current" aria-hidden="true" />
-                          <span className="font-mono tabular-nums">
-                            Stop ({formatTimer(recordingSeconds)})
-                          </span>
-                        </>
-                      ) : (
-                        <>
-                          <Mic className="h-5 w-5" aria-hidden="true" />
-                          <span>{voiceItem?.transcript ? 'Re-record phrase' : 'Record phrase'}</span>
-                        </>
-                      )}
-                    </button>
-
-                    {speechLang && isWebSpeechSupported() && !isRec && (
-                      <button
-                        type="button"
-                        disabled={isProcessing || isQueued || isListeningBrowser}
-                        onClick={() => void handleVoiceTestBrowserSpeech(phrase, speechLang)}
-                        className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-xl border border-stone-300 bg-[#FAF9F5] px-3.5 py-1.5 text-xs font-semibold text-stone-800 hover:bg-amber-50 disabled:opacity-55 dark:border-emerald-900/80 dark:bg-[#0D1310] dark:text-stone-200 dark:hover:bg-emerald-950/50 whitespace-nowrap"
-                      >
-                        {isListeningBrowser ? (
-                          <>
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-                            <span>Listening ({phrase.sourceLanguage})…</span>
-                          </>
-                        ) : (
-                          <>
-                            <Mic className="h-3.5 w-3.5 text-emerald-700 dark:text-amber-300" aria-hidden="true" />
-                            <span>Use browser speech ({phrase.sourceLanguage})</span>
-                          </>
-                        )}
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {/* Visible Voice Error Alert */}
-                {vErr && (
-                  <div
-                    role="alert"
-                    className="mt-3 space-y-2.5 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3 text-xs text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-100"
-                  >
-                    <div className="flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between">
-                      <div className="flex items-start gap-2">
-                        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-700 dark:text-rose-300" aria-hidden="true" />
-                        <span className="leading-relaxed">{vErr}</span>
-                      </div>
-                      <button
-                        type="button"
-                        disabled={isProcessing || isQueued || isListeningBrowser}
-                        onClick={() => handleRetryVoicePhrase(phrase, voiceItem)}
-                        className="inline-flex min-h-[36px] shrink-0 items-center justify-center gap-1.5 rounded-lg border border-rose-300 bg-white px-3 py-1.5 font-semibold text-rose-900 hover:bg-rose-100 disabled:opacity-50 dark:border-rose-800 dark:bg-rose-950 dark:text-rose-100 whitespace-nowrap"
-                      >
-                        <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
-                        <span>Retry</span>
-                      </button>
-                    </div>
-
-                    {showFallback && (
-                      <div className="border-t border-rose-200/80 pt-2 dark:border-rose-900/60 flex flex-wrap items-center gap-2">
-                        {speechLang && isWebSpeechSupported() ? (
-                          <button
-                            type="button"
-                            disabled={isProcessing || isQueued || isListeningBrowser}
-                            onClick={() => void handleVoiceTestBrowserSpeech(phrase, speechLang)}
-                            className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-rose-300 bg-white px-3 py-1.5 font-semibold text-stone-900 hover:bg-amber-50 dark:border-rose-800 dark:bg-[#141D18] dark:text-stone-100"
-                          >
-                            <Mic className="h-3.5 w-3.5 text-emerald-700 dark:text-amber-300" aria-hidden="true" />
-                            <span>Try browser speech ({phrase.sourceLanguage})</span>
-                          </button>
-                        ) : (
-                          <span className="text-rose-800 dark:text-rose-200">
-                            {phrase.sourceLanguage === 'Luganda'
-                              ? 'Luganda voice requires server audio transcription. Check microphone permissions and try again.'
-                              : 'Browser speech fallback is unavailable on this browser.'}
-                          </span>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/* Transcript & Translation Evaluation Grid */}
-                {(voiceItem?.transcript || voiceItem?.output) && (
-                  <div className="mt-4 grid grid-cols-1 gap-5 border-t border-stone-100 pt-4 dark:border-emerald-950/70 lg:grid-cols-2">
-                    {/* Transcript Evaluation */}
-                    <div className="space-y-3">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-semibold text-stone-600 dark:text-stone-300">
-                          Heard transcript ({voiceItem.detectedLanguage ?? phrase.sourceLanguage})
-                        </span>
-                        {voiceItem.transcript && (
-                          <button
-                            type="button"
-                            disabled={isProcessing || isQueued}
-                            onClick={() =>
-                              enqueueVoiceTranscriptTranslation(
-                                phrase,
-                                voiceItem.suggestedTranscriptFix?.trim() || voiceItem.transcript || '',
-                                selectedModel,
-                              )
-                            }
-                            className="inline-flex min-h-[32px] items-center gap-1 rounded-lg px-2 py-1 text-xs font-semibold text-emerald-800 hover:bg-emerald-50 disabled:opacity-50 dark:text-amber-300 dark:hover:bg-emerald-950/50"
-                          >
-                            <RefreshCw className="h-3 w-3" aria-hidden="true" />
-                            <span>Re-translate with {activeModelMeta.label}</span>
-                          </button>
-                        )}
-                      </div>
-                      <p className="rounded-xl bg-[#FAF9F5] px-3.5 py-2.5 text-sm font-medium text-stone-900 dark:bg-[#0D1310] dark:text-stone-100">
-                        {voiceItem.transcript}
-                      </p>
-
-                      <div className="space-y-2">
-                        <span className="block text-xs font-semibold text-stone-700 dark:text-stone-300">
-                          Rate transcript accuracy
-                        </span>
-                        <div className="flex flex-wrap gap-1.5">
-                          {RATING_OPTIONS.map((opt) => (
-                            <button
-                              key={`tr-${opt.value}`}
-                              type="button"
-                              onClick={() =>
-                                onUpdateVoiceEvaluation(selectedModel, phrase.id, {
-                                  transcriptRating: opt.value,
-                                })
-                              }
-                              className={`inline-flex min-h-[40px] items-center gap-1 rounded-xl border px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${ratingButtonClass(
-                                voiceItem.transcriptRating,
-                                opt.value,
-                              )}`}
-                            >
-                              {voiceItem.transcriptRating === opt.value && (
-                                <Check className="h-3.5 w-3.5" aria-hidden="true" />
-                              )}
-                              <span>{opt.label}</span>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-
-                      <div>
-                        <label htmlFor={`vfix-tr-${phrase.id}`} className="sr-only">
-                          Better transcript for {phrase.id}
-                        </label>
-                        <input
-                          id={`vfix-tr-${phrase.id}`}
-                          type="text"
-                          value={voiceItem.suggestedTranscriptFix ?? ''}
-                          onChange={(e) =>
-                            onUpdateVoiceEvaluation(selectedModel, phrase.id, {
-                              suggestedTranscriptFix: e.target.value,
-                            })
-                          }
-                          placeholder="Optional: correct the transcript…"
-                          className="min-h-[40px] w-full rounded-xl border border-stone-200 bg-[#FAF9F5] px-3 py-2 text-xs text-stone-900 placeholder:text-stone-400 focus:border-amber-600 focus:outline-none dark:border-emerald-900/70 dark:bg-[#0D1310] dark:text-stone-100 dark:placeholder:text-stone-500"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Translation Evaluation */}
-                    <div className="space-y-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span className="text-xs font-semibold text-stone-600 dark:text-stone-300">
-                          Translation ({voiceItem.resolvedTargetLanguage ?? phrase.targetLanguage})
-                        </span>
-                        {voiceItem.confidence && (
-                          <ConfidenceBadge level={voiceItem.confidence} />
-                        )}
-                      </div>
-                      <p className="rounded-xl bg-[#FAF9F5] px-3.5 py-2.5 text-sm font-semibold text-stone-900 dark:bg-[#0D1310] dark:text-stone-100">
-                        {voiceItem.output}
-                      </p>
-                      {voiceItem.modelUsed && (
-                        <p className="font-mono text-[11px] text-stone-500 dark:text-stone-400">
-                          Model: {voiceItem.modelUsed}
-                        </p>
-                      )}
-                      {voiceItem.notes && (
-                        <p className="text-xs text-stone-500 dark:text-stone-400">
-                          Note: {voiceItem.notes}
-                        </p>
-                      )}
-
-                      <div className="space-y-2">
-                        <span className="block text-xs font-semibold text-stone-700 dark:text-stone-300">
-                          Rate translation quality
-                        </span>
-                        <div className="flex flex-wrap gap-1.5">
-                          {RATING_OPTIONS.map((opt) => (
-                            <button
-                              key={`tl-${opt.value}`}
-                              type="button"
-                              onClick={() =>
-                                onUpdateVoiceEvaluation(selectedModel, phrase.id, {
-                                  translationRating: opt.value,
-                                })
-                              }
-                              className={`inline-flex min-h-[40px] items-center gap-1 rounded-xl border px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${ratingButtonClass(
-                                voiceItem.translationRating,
-                                opt.value,
-                              )}`}
-                            >
-                              {voiceItem.translationRating === opt.value && (
-                                <Check className="h-3.5 w-3.5" aria-hidden="true" />
-                              )}
-                              <span>{opt.label}</span>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-
-                      <div>
-                        <label htmlFor={`vfix-tl-${phrase.id}`} className="sr-only">
-                          Better translation for {phrase.id}
-                        </label>
-                        <input
-                          id={`vfix-tl-${phrase.id}`}
-                          type="text"
-                          value={voiceItem.suggestedTranslationFix ?? ''}
-                          onChange={(e) =>
-                            onUpdateVoiceEvaluation(selectedModel, phrase.id, {
-                              suggestedTranslationFix: e.target.value,
-                            })
-                          }
-                          placeholder="Optional: type a better translation…"
-                          className="min-h-[40px] w-full rounded-xl border border-stone-200 bg-[#FAF9F5] px-3 py-2 text-xs text-stone-900 placeholder:text-stone-400 focus:border-amber-600 focus:outline-none dark:border-emerald-900/70 dark:bg-[#0D1310] dark:text-stone-100 dark:placeholder:text-stone-500"
                         />
                       </div>
                     </div>

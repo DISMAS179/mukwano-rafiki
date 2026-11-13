@@ -1,9 +1,11 @@
 import type {
+  BadReplyReport,
   BadTranslationReport,
+  ChatTestCase,
+  ChatTestEvaluation,
   ModelChoice,
   TestPhrase,
   TestPhraseEvaluation,
-  VoiceTestEvaluation,
 } from '../types';
 
 import { DEFAULT_MODEL_CONFIG, type ServerHealthConfig } from './api';
@@ -17,22 +19,34 @@ function escapeCsvCell(value: string | undefined | null): string {
 }
 
 function defaultModelLabelForChoice(
-  choice?: ModelChoice,
+  choice?: ModelChoice | string,
   modelConfig: ServerHealthConfig = DEFAULT_MODEL_CONFIG,
 ): string {
-  if (choice === 'alternative') return modelConfig.alternativeModel;
-  if (choice === 'fallback') return modelConfig.fallbackModel;
+  if (choice === 'secondary') return modelConfig.secondaryModel;
   return modelConfig.primaryModel;
 }
 
-export function buildCsvExport(
-  phrases: TestPhrase[],
-  evaluations: Record<string, TestPhraseEvaluation>,
-  voiceEvaluations: Record<string, VoiceTestEvaluation>,
-  reports: BadTranslationReport[],
-  modelConfig: ServerHealthConfig = DEFAULT_MODEL_CONFIG,
-): string {
+export function buildCsvExport(params: {
+  chatCases: ChatTestCase[];
+  chatEvaluations: Record<string, ChatTestEvaluation>;
+  badReplyReports: BadReplyReport[];
+  phrases: TestPhrase[];
+  evaluations: Record<string, TestPhraseEvaluation>;
+  reports: BadTranslationReport[];
+  modelConfig?: ServerHealthConfig;
+}): string {
+  const {
+    chatCases,
+    chatEvaluations,
+    badReplyReports,
+    phrases,
+    evaluations,
+    reports,
+    modelConfig = DEFAULT_MODEL_CONFIG,
+  } = params;
+
   const phraseMap = new Map<string, TestPhrase>(phrases.map((p) => [p.id, p]));
+  const chatCaseMap = new Map<string, ChatTestCase>(chatCases.map((c) => [c.id, c]));
 
   const headers = [
     'record_type',
@@ -45,17 +59,87 @@ export function buildCsvExport(
     'target_language',
     'language_pair',
     'input_text',
-    'transcript',
-    'transcript_rating',
-    'suggested_transcript_fix',
     'model_output',
     'translation_rating',
     'suggested_translation_fix',
     'confidence',
     'notes',
+    'detected_emotion',
+    'understood_me',
+    'natural_language',
+    'helpful_advice',
+    'safe',
+    'better_reply',
   ];
 
   const rows: string[][] = [headers];
+
+  for (const chatEval of Object.values(chatEvaluations)) {
+    if (
+      !chatEval.reply &&
+      !chatEval.understoodMe &&
+      !chatEval.naturalLanguage &&
+      !chatEval.helpfulAdvice &&
+      !chatEval.safe &&
+      !chatEval.betterReply
+    ) {
+      continue;
+    }
+    const testCase = chatCaseMap.get(chatEval.caseId);
+    if (!testCase) continue;
+    const modelName =
+      chatEval.modelUsed || defaultModelLabelForChoice(chatEval.modelChoice, modelConfig);
+
+    rows.push([
+      'chatbot_test_rating',
+      testCase.id,
+      chatEval.updatedAt ?? '',
+      modelName,
+      testCase.caseType,
+      'Chatbot',
+      chatEval.detectedLanguage || testCase.languageHint,
+      '',
+      '',
+      testCase.message,
+      chatEval.reply ?? '',
+      '',
+      '',
+      chatEval.confidence ?? '',
+      chatEval.whyThisAdvice ?? '',
+      chatEval.detectedEmotion ?? '',
+      chatEval.understoodMe ?? '',
+      chatEval.naturalLanguage ?? '',
+      chatEval.helpfulAdvice ?? '',
+      chatEval.safe ?? '',
+      chatEval.betterReply ?? '',
+    ]);
+  }
+
+  for (const badReply of badReplyReports) {
+    rows.push([
+      'bad_reply_report',
+      badReply.id,
+      badReply.timestamp,
+      badReply.model_used ?? '',
+      'Chat Report',
+      'Chatbot',
+      badReply.detectedLanguage,
+      '',
+      '',
+      badReply.userMessage,
+      badReply.botReply,
+      '',
+      '',
+      '',
+      '',
+      badReply.detectedEmotion,
+      'no',
+      '',
+      'no',
+      '',
+      badReply.suggestedBetterReply,
+    ]);
+  }
 
   for (const evalItem of Object.values(evaluations)) {
     if (!evalItem.output && !evalItem.rating && !evalItem.suggestedFix) continue;
@@ -78,55 +162,17 @@ export function buildCsvExport(
       resolvedTarget,
       pair,
       phrase.phrase,
-      '',
-      '',
-      '',
       evalItem.output ?? '',
       evalItem.rating ?? '',
       evalItem.suggestedFix ?? '',
       evalItem.confidence ?? '',
       evalItem.notes ?? '',
-    ]);
-  }
-
-  for (const voiceItem of Object.values(voiceEvaluations)) {
-    if (
-      !voiceItem.transcript &&
-      !voiceItem.output &&
-      !voiceItem.transcriptRating &&
-      !voiceItem.translationRating &&
-      !voiceItem.suggestedTranscriptFix &&
-      !voiceItem.suggestedTranslationFix
-    ) {
-      continue;
-    }
-    const phrase = phraseMap.get(voiceItem.phraseId);
-    if (!phrase) continue;
-
-    const resolvedTarget = voiceItem.resolvedTargetLanguage || phrase.targetLanguage;
-    const pair = `${voiceItem.detectedLanguage || phrase.sourceLanguage} -> ${resolvedTarget}`;
-    const modelName =
-      voiceItem.modelUsed || defaultModelLabelForChoice(voiceItem.modelChoice, modelConfig);
-
-    rows.push([
-      'voice_test_rating',
-      phrase.id,
-      voiceItem.updatedAt ?? '',
-      modelName,
-      phrase.category,
-      phrase.domain,
-      voiceItem.detectedLanguage || phrase.sourceLanguage,
-      resolvedTarget,
-      pair,
-      phrase.phrase,
-      voiceItem.transcript ?? '',
-      voiceItem.transcriptRating ?? '',
-      voiceItem.suggestedTranscriptFix ?? '',
-      voiceItem.output ?? '',
-      voiceItem.translationRating ?? '',
-      voiceItem.suggestedTranslationFix ?? '',
-      voiceItem.confidence ?? '',
-      voiceItem.notes ?? '',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
     ]);
   }
 
@@ -143,12 +189,15 @@ export function buildCsvExport(
       parts[1] ?? '',
       report.languagePair,
       report.input,
-      '',
-      '',
-      '',
       report.output,
       'wrong',
       report.suggestedFix,
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
       '',
       '',
     ]);

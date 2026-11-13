@@ -1,6 +1,8 @@
 {
   "name": "Mukwano-Rafiki",
   "description": "Luganda–Swahili–English Translator Helper for students, market vendors, and clinic visitors in East Africa.",
-  "requestFramePermissions": ["microphone"],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

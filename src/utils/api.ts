@@ -1,16 +1,15 @@
 import type {
+  ChatResponse,
   DomainOption,
   ModelChoice,
   TargetLanguageOption,
   TranslationResponse,
-  VoiceTranslationResponse,
+  UserProfile,
 } from '../types';
 
 export type ApiErrorCode =
-  | 'AUDIO_UNSUPPORTED'
-  | 'NO_SPEECH'
-  | 'BACKGROUND_NOISE'
   | 'HIGH_DEMAND'
+  | 'QUOTA_EXCEEDED'
   | 'TIMEOUT'
   | 'MODEL_NOT_FOUND'
   | 'NETWORK'
@@ -18,16 +17,12 @@ export type ApiErrorCode =
 
 export interface ServerHealthConfig {
   primaryModel: string;
-  alternativeModel: string;
-  fallbackModel: string;
-  audioTranscribeModel: string;
+  secondaryModel: string;
 }
 
 export const DEFAULT_MODEL_CONFIG: ServerHealthConfig = {
-  primaryModel: 'gemma-4-26b-a4b-it',
-  alternativeModel: 'gemma-4-31b-it',
-  fallbackModel: 'gemini-4-hydrogen',
-  audioTranscribeModel: 'gemini-3.5-transcribe',
+  primaryModel: 'gemini-3.1-flash-lite',
+  secondaryModel: 'gemini-4-hydrogen',
 };
 
 export const TEST_MODE_REQUEST_DELAY_MS = 500;
@@ -43,10 +38,8 @@ export class TranslationApiError extends Error {
 }
 
 function mapCode(rawCode: string): ApiErrorCode {
-  if (rawCode === 'AUDIO_UNSUPPORTED') return 'AUDIO_UNSUPPORTED';
-  if (rawCode === 'NO_SPEECH') return 'NO_SPEECH';
-  if (rawCode === 'BACKGROUND_NOISE') return 'BACKGROUND_NOISE';
   if (rawCode === 'HIGH_DEMAND' || rawCode === 'RATE_LIMITED') return 'HIGH_DEMAND';
+  if (rawCode === 'QUOTA_EXCEEDED') return 'QUOTA_EXCEEDED';
   if (rawCode === 'TIMEOUT') return 'TIMEOUT';
   if (rawCode === 'MODEL_NOT_FOUND') return 'MODEL_NOT_FOUND';
   if (rawCode === 'ENDPOINT_UNREACHABLE') return 'NETWORK';
@@ -101,7 +94,7 @@ async function readNdjsonOrJsonResponse<T>(
             const errMsg =
               typeof parsed.error === 'string'
                 ? parsed.error
-                : 'Translation could not be completed right now. Please try again.';
+                : 'The request could not be completed right now. Please try again.';
             throw new TranslationApiError(errMsg, mapCode(rawCode));
           }
         }
@@ -118,7 +111,7 @@ async function readNdjsonOrJsonResponse<T>(
         const errMsg =
           typeof parsed.error === 'string'
             ? parsed.error
-            : 'Translation could not be completed right now. Please try again.';
+            : 'The request could not be completed right now. Please try again.';
         throw new TranslationApiError(errMsg, mapCode(rawCode));
       }
     }
@@ -128,7 +121,7 @@ async function readNdjsonOrJsonResponse<T>(
     }
 
     throw new TranslationApiError(
-      'Translation response ended unexpectedly. Please try again.',
+      'Server response ended unexpectedly. Please try again.',
       'UNKNOWN',
     );
   }
@@ -150,7 +143,7 @@ async function readNdjsonOrJsonResponse<T>(
     const errMsg =
       typeof obj.error === 'string'
         ? obj.error
-        : `Translation failed (HTTP ${response.status}). Please try again.`;
+        : `Request failed (HTTP ${response.status}). Please try again.`;
     throw new TranslationApiError(errMsg, mapCode(rawCode));
   }
 
@@ -164,13 +157,40 @@ export async function fetchHealthConfig(): Promise<ServerHealthConfig> {
     const data = (await res.json()) as Partial<ServerHealthConfig>;
     return {
       primaryModel: data.primaryModel || DEFAULT_MODEL_CONFIG.primaryModel,
-      alternativeModel: data.alternativeModel || DEFAULT_MODEL_CONFIG.alternativeModel,
-      fallbackModel: data.fallbackModel || DEFAULT_MODEL_CONFIG.fallbackModel,
-      audioTranscribeModel: data.audioTranscribeModel || DEFAULT_MODEL_CONFIG.audioTranscribeModel,
+      secondaryModel: data.secondaryModel || DEFAULT_MODEL_CONFIG.secondaryModel,
     };
   } catch {
     return DEFAULT_MODEL_CONFIG;
   }
+}
+
+export async function sendChatMessage(params: {
+  message: string;
+  history?: Array<{ role: 'user' | 'assistant'; text: string }>;
+  profile?: Partial<UserProfile>;
+  modelChoice?: ModelChoice;
+  onStatus?: (message: string) => void;
+}): Promise<ChatResponse> {
+  const { onStatus, ...payload } = params;
+
+  let response: Response;
+  try {
+    response = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/x-ndjson, application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch {
+    throw new TranslationApiError(
+      'Unable to reach the server. Check your internet connection and try again.',
+      'NETWORK',
+    );
+  }
+
+  return readNdjsonOrJsonResponse<ChatResponse>(response, onStatus);
 }
 
 export async function translateText(params: {
@@ -200,34 +220,4 @@ export async function translateText(params: {
   }
 
   return readNdjsonOrJsonResponse<TranslationResponse>(response, onStatus);
-}
-
-export async function translateVoice(params: {
-  audioBase64: string;
-  mimeType: string;
-  targetLanguage: TargetLanguageOption;
-  domain: DomainOption;
-  modelChoice?: ModelChoice;
-  onStatus?: (message: string) => void;
-}): Promise<VoiceTranslationResponse> {
-  const { onStatus, ...payload } = params;
-
-  let response: Response;
-  try {
-    response = await fetch('/api/translate-voice', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/x-ndjson, application/json',
-      },
-      body: JSON.stringify(payload),
-    });
-  } catch {
-    throw new TranslationApiError(
-      'Network error while uploading audio. You can use browser voice for English or Swahili, while Luganda voice needs a connection to the server.',
-      'NETWORK',
-    );
-  }
-
-  return readNdjsonOrJsonResponse<VoiceTranslationResponse>(response, onStatus);
 }
